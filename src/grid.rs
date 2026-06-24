@@ -1,0 +1,638 @@
+//! 2D grid alignment: take two tables of strings and produce one aligned grid
+//! with cell-, row-, and column-level change status. Format-agnostic — it has
+//! no knowledge of Excel, CSV, RTF or any particular file format; callers parse
+//! their format into `&[Vec<String>]` and hand the grid to [`grid_diff`].
+//!
+//! Algorithm (ported from `shtuka-core/src/excel.rs`, sans the ExcelResult
+//! / sheet-union wrapper):
+//! 1. Detect the header row on each side (the first row that fills ≥
+//!    [`GridOptions::header_fill_ratio`] of the width).
+//! 2. Run a line-diff over the header cells to align columns, producing a slot
+//!    list mapping each output column to (a_col, b_col); a slot with one side
+//!    missing means an added/removed column.
+//! 3. Run a line-diff over row signatures (cells joined by a separator) to
+//!    align rows, with an [`GridOptions::lcs_row_budget`] cap beyond which rows
+//!    are aligned positionally.
+//! 4. For each unpaired delete/insert pair left over, check row similarity and
+//!    promote to `modified` when above threshold (the grid-level analogue of
+//!    [`crate::inline::pair_replacements`]).
+//! 5. For each row slot, render cells from each side through the column slots
+//!    and tag `equal | modified | added | removed` per cell.
+
+use crate::inline::{Op, OpType};
+use serde::{Deserialize, Serialize};
+
+/// Status of one cell, row, or column in the aligned grid.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Status {
+    Equal,
+    Modified,
+    Added,
+    Removed,
+}
+
+impl Status {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Status::Equal => "equal",
+            Status::Modified => "modified",
+            Status::Added => "added",
+            Status::Removed => "removed",
+        }
+    }
+}
+
+/// One diffed cell: status plus the A and B text (either may be empty when the
+/// cell only exists on one side).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CellChange {
+    pub status: Status,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub old: String,
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "new")]
+    pub new_val: String,
+}
+
+/// One aligned column slot: its name (Excel-style letter or 0-based index) and
+/// its status across the two sides.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridColumn {
+    pub name: String,
+    pub status: Status,
+}
+
+/// One aligned row: its status and source-row pointers (1-based, 0 = absent).
+/// `header` flags the detected header row for the UI.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridRow {
+    pub status: Status,
+    #[serde(rename = "rowA")]
+    pub row_a: usize,
+    #[serde(rename = "rowB")]
+    pub row_b: usize,
+    pub header: bool,
+    pub cells: Vec<CellChange>,
+}
+
+/// The result of diffing two grids: aligned columns, rows, and per-cell status.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct GridDiff {
+    pub columns: Vec<GridColumn>,
+    pub rows: Vec<GridRow>,
+    pub added_rows: usize,
+    pub removed_rows: usize,
+    pub modified_rows: usize,
+    pub added_cols: usize,
+    pub removed_cols: usize,
+    /// Operational notes (e.g. "row count exceeded budget, positional alignment").
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// Configuration for [`grid_diff`]. Defaults match the clinical-Excel heuristics
+/// the algorithm was tuned for, but every knob is exposed so non-Excel callers
+/// (small CSVs, very large SQL result sets, sparse ledgers) can override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GridOptions {
+    /// Hard cap on rows considered. Above this the caller should truncate.
+    pub max_rows: usize,
+    /// Hard cap on columns considered per row. Above this the caller should truncate.
+    pub max_cols: usize,
+    /// Row alignment is abandoned at this total row count (A+B) for performance;
+    /// rows past the budget are paired positionally. Raise for server use.
+    pub lcs_row_budget: usize,
+    /// A row is considered a header if it fills ≥ `header_fill_ratio` of the
+    /// grid width. 0.8 matches the default the Excel engine was tuned with.
+    pub header_fill_ratio: f32,
+    /// Similarity threshold for promoting a leftover del+ins row pair to
+    /// `Modified`. 0.5 matches ROW87_W_LIGHT's explicit default.
+    pub row_similarity_threshold: f64,
+    /// Threshold passed to [`inline_segments`] when the caller wants word-level
+    /// cell-level highlights (not used in `grid_diff` itself today, but reserved
+    /// for the common pattern of pairing cells with inline segments).
+    pub inline_threshold: f64,
+}
+
+impl Default for GridOptions {
+    fn default() -> Self {
+        GridOptions {
+            max_rows: 50_000,
+            max_cols: 256,
+            lcs_row_budget: 4_000,
+            header_fill_ratio: 0.8,
+            row_similarity_threshold: 0.5,
+            inline_threshold: 0.5,
+        }
+    }
+}
+
+/// Diff two string grids and produce one aligned grid.
+///
+/// `rows_a` / `rows_b` are arbitrary `&[Vec<String>]`; they typically come from
+/// parsing xlsx/CSV/RTF/SQL/etc., but `grid_diff` doesn't know or care. Each
+/// row is one record; each cell is already stringified. Rows beyond
+/// [`GridOptions::max_rows`] should be truncated by the caller.
+pub fn grid_diff(
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    opts: &GridOptions,
+) -> GridDiff {
+    let width_a = max_width(rows_a);
+    let width_b = max_width(rows_b);
+    let width = width_a.max(width_b);
+
+    let header_a = detect_header_row(rows_a, width, opts.header_fill_ratio);
+    let header_b = detect_header_row(rows_b, width, opts.header_fill_ratio);
+
+    let slots = align_columns(rows_a, rows_b, width_a, width_b, header_a, header_b);
+
+    let mut gd = GridDiff::default();
+
+    gd.columns = Vec::with_capacity(slots.len());
+    for (k, slot) in slots.iter().enumerate() {
+        let status = match (slot.a >= 0, slot.b >= 0) {
+            (false, true) => { gd.added_cols += 1; Status::Added }
+            (true, false) => { gd.removed_cols += 1; Status::Removed }
+            _ => Status::Equal,
+        };
+        gd.columns.push(GridColumn { name: col_letter(k), status });
+    }
+
+    let row_pairs = align_rows(rows_a, rows_b, &slots, opts);
+
+    for rp in &row_pairs {
+        let mut gr = build_grid_row(*rp, rows_a, rows_b, &slots);
+        if (gr.row_a != 0 && gr.row_a == header_a) || (gr.row_b != 0 && gr.row_b == header_b) {
+            gr.header = true;
+        }
+        match gr.status {
+            Status::Added => gd.added_rows += 1,
+            Status::Removed => gd.removed_rows += 1,
+            Status::Modified => gd.modified_rows += 1,
+            _ => {}
+        }
+        gd.rows.push(gr);
+    }
+
+    gd
+}
+
+fn max_width(rows: &[Vec<String>]) -> usize {
+    rows.iter().map(|r| r.len()).max().unwrap_or(0)
+}
+
+/// detect_header_row returns the 1-based index of the row that most likely is
+/// the table header: the first row filling ≥ `header_fill_ratio` of the width.
+/// 0 if none.
+fn detect_header_row(rows: &[Vec<String>], width: usize, ratio: f32) -> usize {
+    if width < 2 {
+        return 0;
+    }
+    let threshold = ((width as f32 * ratio) + 0.5) as usize;
+    let mut best_row = 0;
+    let mut best_filled = 0;
+    for (i, r) in rows.iter().enumerate() {
+        let filled = r.iter().filter(|c| !c.trim().is_empty()).count();
+        if filled >= threshold && filled > best_filled {
+            best_filled = filled;
+            best_row = i + 1;
+        }
+    }
+    best_row
+}
+
+/// Convert a 0-based column index to its Excel-style letter (0 -> A, 25 -> Z,
+/// 26 -> AA). Useful for display names when the source format has no header.
+pub fn col_letter(mut i: usize) -> String {
+    let mut b: Vec<u8> = Vec::new();
+    i += 1;
+    while i > 0 {
+        i -= 1;
+        b.insert(0, b'A' + (i % 26) as u8);
+        i /= 26;
+    }
+    String::from_utf8(b).unwrap()
+}
+
+/// One column slot in the aligned grid. `a`/`b` are 0-based source column
+/// indices, or -1 when the column exists only on the other side.
+#[derive(Clone, Copy)]
+struct ColSlot {
+    a: isize,
+    b: isize,
+}
+
+/// align_columns matches A's columns to B's by LCS over the header-row cells,
+/// so an inserted or removed column is detected instead of shifting every row.
+/// When no usable header is found (or headers are identical in width), it falls
+/// back to positional 1:1 slots.
+fn align_columns(
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    width_a: usize,
+    width_b: usize,
+    header_a: usize,
+    header_b: usize,
+) -> Vec<ColSlot> {
+    let head_a: &[String] = if header_a > 0 { &rows_a[header_a - 1] } else { &[] };
+    let head_b: &[String] = if header_b > 0 { &rows_b[header_b - 1] } else { &[] };
+
+    let usable = header_a > 0
+        && header_b > 0
+        && head_a.iter().filter(|c| !c.trim().is_empty()).count() >= 2
+        && head_b.iter().filter(|c| !c.trim().is_empty()).count() >= 2;
+
+    if !usable {
+        let n = width_a.max(width_b);
+        return (0..n)
+            .map(|i| ColSlot {
+                a: if i < width_a { i as isize } else { -1 },
+                b: if i < width_b { i as isize } else { -1 },
+            })
+            .collect();
+    }
+
+    let norm = |s: &str| s.trim().to_lowercase();
+    let ka: Vec<String> = (0..width_a)
+        .map(|i| norm(head_a.get(i).map(|s| s.as_str()).unwrap_or("")))
+        .collect();
+    let kb: Vec<String> = (0..width_b)
+        .map(|i| norm(head_b.get(i).map(|s| s.as_str()).unwrap_or("")))
+        .collect();
+    let ops = lcs_diff(&ka, &kb);
+
+    let mut slots: Vec<ColSlot> = Vec::new();
+    for op in &ops {
+        match op.typ {
+            OpType::Equal => slots.push(ColSlot { a: op.a as isize - 1, b: op.b as isize - 1 }),
+            OpType::Delete => slots.push(ColSlot { a: op.a as isize - 1, b: -1 }),
+            OpType::Insert => slots.push(ColSlot { a: -1, b: op.b as isize - 1 }),
+            OpType::Replace => {}
+        }
+    }
+    slots
+}
+
+#[derive(Clone, Copy)]
+struct RowPair {
+    a: isize,
+    b: isize,
+}
+
+fn align_rows(
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    slots: &[ColSlot],
+    opts: &GridOptions,
+) -> Vec<RowPair> {
+    if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
+        return align_rows_by_position(rows_a, rows_b);
+    }
+    align_rows_by_lcs(rows_a, rows_b, slots, opts)
+}
+
+fn align_rows_by_position(rows_a: &[Vec<String>], rows_b: &[Vec<String>]) -> Vec<RowPair> {
+    let n = rows_a.len().max(rows_b.len());
+    let mut pairs = Vec::with_capacity(n);
+    for i in 0..n {
+        pairs.push(RowPair {
+            a: if i < rows_a.len() { i as isize } else { -1 },
+            b: if i < rows_b.len() { i as isize } else { -1 },
+        });
+    }
+    pairs
+}
+
+fn align_rows_by_lcs(
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    slots: &[ColSlot],
+    opts: &GridOptions,
+) -> Vec<RowPair> {
+    let cols_a: Vec<usize> = slots.iter().filter(|s| s.a >= 0 && s.b >= 0).map(|s| s.a as usize).collect();
+    let cols_b: Vec<usize> = slots.iter().filter(|s| s.a >= 0 && s.b >= 0).map(|s| s.b as usize).collect();
+    let sig_a = signatures(rows_a, &cols_a);
+    let sig_b = signatures(rows_b, &cols_b);
+    let ops = lcs_diff(&sig_a, &sig_b);
+
+    let mut pairs: Vec<RowPair> = Vec::new();
+    let mut pending_del: Vec<usize> = Vec::new();
+    let mut pending_ins: Vec<usize> = Vec::new();
+
+    for op in &ops {
+        match op.typ {
+            OpType::Equal => {
+                pairs.extend(repair_gap(&pending_del, &pending_ins, rows_a, rows_b, slots, opts));
+                pending_del.clear();
+                pending_ins.clear();
+                pairs.push(RowPair { a: op.a as isize - 1, b: op.b as isize - 1 });
+            }
+            OpType::Delete => pending_del.push(op.a - 1),
+            OpType::Insert => pending_ins.push(op.b - 1),
+            OpType::Replace => {}
+        }
+    }
+    pairs.extend(repair_gap(&pending_del, &pending_ins, rows_a, rows_b, slots, opts));
+    pairs
+}
+
+/// repair_gap matches deleted rows to inserted rows by similarity, turning close
+/// matches into modified pairs; leftovers stay pure delete/insert.
+fn repair_gap(
+    dels: &[usize],
+    ins: &[usize],
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    slots: &[ColSlot],
+    opts: &GridOptions,
+) -> Vec<RowPair> {
+    let mut used_ins = vec![false; ins.len()];
+    let mut match_of_del: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    for &ai in dels {
+        let mut best_j: isize = -1;
+        let mut best_sim = 0.0f64;
+        for (j, &bi) in ins.iter().enumerate() {
+            if used_ins[j] {
+                continue;
+            }
+            let sim = row_similarity(&rows_a[ai], &rows_b[bi], slots);
+            if sim > best_sim {
+                best_sim = sim;
+                best_j = j as isize;
+            }
+        }
+        if best_j >= 0 && best_sim >= opts.row_similarity_threshold {
+            used_ins[best_j as usize] = true;
+            match_of_del.insert(ai, ins[best_j as usize]);
+        }
+    }
+
+    let mut pairs: Vec<RowPair> = Vec::new();
+    for &ai in dels {
+        if let Some(&bi) = match_of_del.get(&ai) {
+            pairs.push(RowPair { a: ai as isize, b: bi as isize });
+        } else {
+            pairs.push(RowPair { a: ai as isize, b: -1 });
+        }
+    }
+    for (j, &bi) in ins.iter().enumerate() {
+        if !used_ins[j] {
+            pairs.push(RowPair { a: -1, b: bi as isize });
+        }
+    }
+    pairs
+}
+
+/// signatures joins each row's cells at the given column indices (the columns
+/// common to both sides), so rows are compared on aligned columns only.
+fn signatures(rows: &[Vec<String>], cols: &[usize]) -> Vec<String> {
+    rows.iter()
+        .map(|r| {
+            cols.iter()
+                .map(|&c| r.get(c).map(|s| s.as_str()).unwrap_or(""))
+                .collect::<Vec<_>>()
+                .join("\u{0}")
+        })
+        .collect()
+}
+
+/// row_similarity compares two rows over the aligned common columns only.
+fn row_similarity(ra: &[String], rb: &[String], slots: &[ColSlot]) -> f64 {
+    let common: Vec<&ColSlot> = slots.iter().filter(|s| s.a >= 0 && s.b >= 0).collect();
+    if common.is_empty() {
+        return 1.0;
+    }
+    let mut same = 0;
+    for s in &common {
+        let va = ra.get(s.a as usize).map(|x| x.as_str()).unwrap_or("");
+        let vb = rb.get(s.b as usize).map(|x| x.as_str()).unwrap_or("");
+        if va == vb {
+            same += 1;
+        }
+    }
+    same as f64 / common.len() as f64
+}
+
+fn build_grid_row(rp: RowPair, rows_a: &[Vec<String>], rows_b: &[Vec<String>], slots: &[ColSlot]) -> GridRow {
+    let ra: &[String] = if rp.a >= 0 { &rows_a[rp.a as usize] } else { &[] };
+    let rb: &[String] = if rp.b >= 0 { &rows_b[rp.b as usize] } else { &[] };
+    let mut gr = GridRow {
+        status: Status::Equal,
+        row_a: if rp.a >= 0 { rp.a as usize + 1 } else { 0 },
+        row_b: if rp.b >= 0 { rp.b as usize + 1 } else { 0 },
+        header: false,
+        cells: Vec::with_capacity(slots.len()),
+    };
+
+    let row_status = if rp.a < 0 {
+        Status::Added
+    } else if rp.b < 0 {
+        Status::Removed
+    } else {
+        Status::Equal
+    };
+    gr.status = row_status;
+
+    let get = |row: &[String], idx: isize| -> String {
+        if idx < 0 {
+            String::new()
+        } else {
+            row.get(idx as usize).cloned().unwrap_or_default()
+        }
+    };
+
+    let mut modified = false;
+    for slot in slots {
+        let va = get(ra, slot.a);
+        let vb = get(rb, slot.b);
+        let cc = if slot.b < 0 {
+            CellChange { status: Status::Removed, old: va, new_val: String::new() }
+        } else if slot.a < 0 {
+            CellChange { status: Status::Added, old: String::new(), new_val: vb }
+        } else {
+            match row_status {
+                Status::Added => CellChange { status: Status::Added, old: String::new(), new_val: vb },
+                Status::Removed => CellChange { status: Status::Removed, old: va, new_val: String::new() },
+                _ => {
+                    if va != vb {
+                        modified = true;
+                        CellChange { status: Status::Modified, old: va, new_val: vb }
+                    } else {
+                        CellChange { status: Status::Equal, old: String::new(), new_val: vb }
+                    }
+                }
+            }
+        };
+        gr.cells.push(cc);
+    }
+    if gr.status == Status::Equal && modified {
+        gr.status = Status::Modified;
+    }
+    gr
+}
+
+/// Small O(n*m) LCS DP shared by [`align_columns`] and [`align_rows_by_lcs`].
+/// Inputs are bounded (column headers or row signatures), so the full DP
+/// table is fine; patience anchoring / Hirschberg are the caller's job, not
+/// ours. This is the same helper used by [`crate::inline`], duplicated here to
+/// keep `grid` self-contained without coupling to `inline`'s private internals.
+fn lcs_diff(a: &[String], b: &[String]) -> Vec<Op> {
+    let n = a.len();
+    let m = b.len();
+    if n == 0 {
+        return b.iter().enumerate().map(|(j, s)| Op::insert(j + 1, s)).collect();
+    }
+    if m == 0 {
+        return a.iter().enumerate().map(|(i, s)| Op::delete(i + 1, s)).collect();
+    }
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in 1..=n {
+        for j in 1..=m {
+            if a[i - 1] == b[j - 1] {
+                dp[i][j] = dp[i - 1][j - 1] + 1;
+            } else {
+                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
+            }
+        }
+    }
+    let mut ops: Vec<Op> = Vec::new();
+    let mut i = n;
+    let mut j = m;
+    while i > 0 || j > 0 {
+        if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
+            ops.push(Op::equal(i, j, &a[i - 1], &b[j - 1]));
+            i -= 1;
+            j -= 1;
+        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
+            ops.push(Op::insert(j, &b[j - 1]));
+            j -= 1;
+        } else {
+            ops.push(Op::delete(i, &a[i - 1]));
+            i -= 1;
+        }
+    }
+    ops.reverse();
+    ops
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grid(rows: &[&[&str]]) -> Vec<Vec<String>> {
+        rows.iter().map(|r| r.iter().map(|s| s.to_string()).collect()).collect()
+    }
+
+    fn counts(gd: &GridDiff) -> (usize, usize, usize, usize) {
+        let (mut a, mut r, mut m, mut e) = (0, 0, 0, 0);
+        for row in &gd.rows {
+            match row.status {
+                Status::Added => a += 1,
+                Status::Removed => r += 1,
+                Status::Modified => m += 1,
+                Status::Equal => e += 1,
+            }
+        }
+        (a, r, m, e)
+    }
+
+    #[test]
+    fn col_letter_basic() {
+        assert_eq!(col_letter(0), "A");
+        assert_eq!(col_letter(25), "Z");
+        assert_eq!(col_letter(26), "AA");
+        assert_eq!(col_letter(27), "AB");
+    }
+
+    #[test]
+    fn inserted_row_no_cascade() {
+        let a = grid(&[&["name", "amount"], &["Alice", "100"], &["Bob", "200"], &["Carl", "300"], &["Dave", "400"]]);
+        let b = grid(&[&["name", "amount"], &["Alice", "100"], &["Bob", "200"], &["NEW", "999"], &["Carl", "300"], &["Dave", "400"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        let (a_n, r, m, e) = counts(&gd);
+        assert_eq!((a_n, m, r), (1, 0, 0), "inserted row cascaded");
+        assert_eq!(e, 5, "want 5 equal rows");
+    }
+
+    #[test]
+    fn single_cell_edit_is_modified() {
+        let a = grid(&[&["id", "v"], &["1", "a"], &["2", "b"], &["3", "c"]]);
+        let b = grid(&[&["id", "v"], &["1", "a"], &["2", "CHANGED"], &["3", "c"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        let (a_n, r, m, e) = counts(&gd);
+        assert_eq!((m, a_n, r), (1, 0, 0));
+        assert_eq!(e, 3);
+    }
+
+    #[test]
+    fn sparse_spec_layout_shows_all_columns() {
+        let a = grid(&[
+            &["DM Domain Mapping Specifications"],
+            &["Protocol Number:", "", "", "STUDY-DEMO-001"],
+            &[],
+            &["Variable Name", "Variable Label", "Type", "Length"],
+            &["STUDYID", "Study Identifier", "C", "20"],
+            &["DOMAIN", "Domain Abbreviation", "C", "2"],
+        ]);
+        let b = grid(&[
+            &["DM Domain Mapping Specifications"],
+            &["Protocol Number:", "", "", "STUDY-DEMO-001"],
+            &[],
+            &["Variable Name", "Variable Label", "Type", "Length"],
+            &["STUDYID", "Study Identifier", "C", "21"],
+            &["DOMAIN", "Domain Abbreviation", "C", "2"],
+        ]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        assert_eq!(gd.columns.len(), 4, "want 4 columns");
+        assert_eq!(gd.columns[0].name, "A");
+        assert_eq!(gd.columns[3].name, "D");
+        let (a_n, r, m, e) = counts(&gd);
+        assert_eq!((m, a_n, r), (1, 0, 0));
+        assert_eq!(e, 5);
+        for row in &gd.rows {
+            if row.status == Status::Modified {
+                assert_eq!(row.cells.len(), 4);
+                assert_eq!(row.cells[3].status, Status::Modified);
+                assert_eq!(row.cells[3].old, "20");
+                assert_eq!(row.cells[3].new_val, "21");
+            }
+        }
+    }
+
+    #[test]
+    fn appended_row_is_added() {
+        let a = grid(&[&["Variable Name", "Type"], &["STUDYID", "C"]]);
+        let b = grid(&[&["Variable Name", "Type"], &["STUDYID", "C"], &["AGE", "N"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        let (a_n, r, m, _) = counts(&gd);
+        assert_eq!((a_n, r, m), (1, 0, 0));
+    }
+
+    #[test]
+    fn inserted_column_detected() {
+        let a = grid(&[&["a", "c"], &["1", "3"], &["4", "6"]]);
+        let b = grid(&[&["a", "b", "c"], &["1", "2", "3"], &["4", "5", "6"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        assert!(gd.added_cols >= 1, "inserted column should be detected");
+    }
+
+    #[test]
+    fn empty_grids() {
+        let a: Vec<Vec<String>> = Vec::new();
+        let b: Vec<Vec<String>> = Vec::new();
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        assert!(gd.rows.is_empty());
+        assert_eq!(gd.added_rows + gd.removed_rows + gd.modified_rows, 0);
+    }
+
+    #[test]
+    fn identical_grids_all_equal() {
+        let a = grid(&[&["h1", "h2"], &["x", "y"], &["1", "2"]]);
+        let b = grid(&[&["h1", "h2"], &["x", "y"], &["1", "2"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        let (a_n, r, m, e) = counts(&gd);
+        assert_eq!((a_n, r, m, e), (0, 0, 0, 3));
+    }
+}
