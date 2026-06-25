@@ -163,27 +163,27 @@ pub fn pair_replacements(ops: Vec<Op>, threshold: f64) -> Vec<Op> {
 /// `(a_segs, b_segs)`. Returns `None` when the lines are below `threshold`
 /// similar — caller should show them as a delete + insert rather than a Replace.
 ///
-/// Tokenization splits on alphanumeric runs, so `Section A.1 ... 17` and
-/// `Section A.1 ... 18` produce segments where only `17` / `18` are flagged
-/// `changed = true`. Unchanged tokens scattered across the line (e.g. `0.020`,
-/// `0.0400` between two changed numbers) stay un-highlighted.
+/// Word-level diffing delegates to [`similar::TextDiff::from_words`] (Myers),
+/// and the similarity check uses [`similar::diff_ratio`] so the threshold's
+/// semantics match `similar`'s own definition. The output `Vec<Seg>` is
+/// tate's own type — `similar` produces Equal/Delete/Insert ops; we collapse
+/// adjacent same-tag runs into a single `Seg` with its `changed` flag.
 pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Vec<Seg>)> {
-    let ta = tokenize(a);
-    let tb = tokenize(b);
-    let ops = lcs_diff(&ta, &tb);
-
-    let mut shared = 0usize;
-    for op in &ops {
-        if op.typ == OpType::Equal {
-            shared += op.a_val.chars().count();
+    let diff = similar::TextDiff::from_words(a, b);
+    // Sørensen–Dice similarity over characters: shared chars on both sides over
+    // total chars. Matches the original shtuka heuristic so callers' thresholds
+    // keep the same meaning.
+    let mut equal_chars = 0usize;
+    for change in diff.iter_all_changes() {
+        if let similar::ChangeTag::Equal = change.tag() {
+            equal_chars += change.value().chars().count();
         }
     }
     let denom = (a.chars().count() + b.chars().count()).max(1) as f64;
-    let similarity = (2 * shared) as f64 / denom;
+    let similarity = (2 * equal_chars) as f64 / denom;
     if similarity < threshold {
         return None;
     }
-
     let mut a_segs: Vec<Seg> = Vec::new();
     let mut b_segs: Vec<Seg> = Vec::new();
     let push = |segs: &mut Vec<Seg>, text: &str, changed: bool| {
@@ -198,96 +198,17 @@ pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Ve
         }
         segs.push(Seg { text: text.to_string(), changed });
     };
-    for op in &ops {
-        match op.typ {
-            OpType::Equal => {
-                push(&mut a_segs, &op.a_val, false);
-                push(&mut b_segs, &op.b_val, false);
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Equal => {
+                push(&mut a_segs, change.value(), false);
+                push(&mut b_segs, change.value(), false);
             }
-            OpType::Delete => push(&mut a_segs, &op.a_val, true),
-            OpType::Insert => push(&mut b_segs, &op.b_val, true),
-            OpType::Replace => {}
+            similar::ChangeTag::Delete => push(&mut a_segs, change.value(), true),
+            similar::ChangeTag::Insert => push(&mut b_segs, change.value(), true),
         }
     }
     Some((a_segs, b_segs))
-}
-
-/// tokenize splits a line into alternating word / non-word (whitespace+punct)
-/// tokens so the token stream reconstructs the line exactly. Each token is a
-/// diff unit, giving word-granularity inline highlights.
-fn tokenize(s: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut cur = String::new();
-    let mut cur_alnum: Option<bool> = None;
-    for ch in s.chars() {
-        let is_alnum = ch.is_alphanumeric();
-        match cur_alnum {
-            Some(prev) if prev == is_alnum => cur.push(ch),
-            _ => {
-                if !cur.is_empty() {
-                    out.push(std::mem::take(&mut cur));
-                }
-                cur.push(ch);
-                cur_alnum = Some(is_alnum);
-            }
-        }
-    }
-    if !cur.is_empty() {
-        out.push(cur);
-    }
-    out
-}
-
-/// Small O(n*m) LCS DP for word-level token alignment. Inputs are tokens of a
-/// single line of text — bounded and tiny (typically tens to a few hundred
-/// tokens), so the full DP table is fine; no patience anchoring or Hirschberg
-/// space reduction is needed here. The big line-diff engine is the caller's
-/// responsibility; this one is an internal word-level helper only.
-fn lcs_diff(a: &[String], b: &[String]) -> Vec<Op> {
-    let n = a.len();
-    let m = b.len();
-    if n == 0 {
-        return b
-            .iter()
-            .enumerate()
-            .map(|(j, s)| Op::insert(j + 1, s))
-            .collect();
-    }
-    if m == 0 {
-        return a
-            .iter()
-            .enumerate()
-            .map(|(i, s)| Op::delete(i + 1, s))
-            .collect();
-    }
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in 1..=n {
-        for j in 1..=m {
-            if a[i - 1] == b[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-            } else {
-                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
-            }
-        }
-    }
-    let mut ops: Vec<Op> = Vec::new();
-    let mut i = n;
-    let mut j = m;
-    while i > 0 || j > 0 {
-        if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
-            ops.push(Op::equal(i, j, &a[i - 1], &b[j - 1]));
-            i -= 1;
-            j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
-            ops.push(Op::insert(j, &b[j - 1]));
-            j -= 1;
-        } else {
-            ops.push(Op::delete(i, &a[i - 1]));
-            i -= 1;
-        }
-    }
-    ops.reverse();
-    ops
 }
 
 #[cfg(test)]
