@@ -1,16 +1,18 @@
 # tate
 
-Structured diff primitives for Rust — grid alignment, tree diff, and inline replacement pairing.
+A self-contained structured diff library for Rust — line diff, grid alignment, tree comparison, and inline word-level highlighting.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 ## Overview
 
-Tate provides three format-agnostic facilities for diffing structured data. Each consumes plain Rust values (`&str`, `&[Vec<String>]`, XML) and returns an aligned, change-tagged result that a UI can render with cell- or word-level highlights. No knowledge of any particular file format or domain schema is built in.
+Tate provides four facilities for diffing structured data, all with zero external diff-engine dependencies:
 
-- **`inline`** — Pairs delete+insert blocks produced by any line-diff engine into `Replace` ops carrying word-level inline segments. A line that turned `foo bar` into `foo baz` becomes one row highlighting only `baz`, not a noisy delete+insert pair.
+- **`lines`** — A production line-diff engine (patience anchors + LCS + Hirschberg linear-space + block-replacement bailout). Produces `Equal | Delete | Insert` ops; feed the result into `inline` to get `Replace` rows with word-level highlights.
 
-- **`grid`** — Aligns two 2D grids of strings (rows × columns) and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs — Excel, CSV, HTML tables, SQL result sets, parsed log tables.
+- **`inline`** — Pairs delete+insert blocks into `Replace` ops carrying word-level inline segments. A line that turned `foo bar` into `foo baz` becomes one row highlighting only `baz`, not a noisy delete+insert pair.
+
+- **`grid`** — Aligns two 2D grids of strings (rows × columns) and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs.
 
 - **`tree`** — Structural diff of two XML documents keyed by identity attributes, emitting `added` / `removed` / `modified` changes per node. Schema-agnostic: callers configure which attributes are identity-bearing via `TreeOptions`.
 
@@ -23,21 +25,18 @@ The line-diff itself (Myers, patience, LCS, Hirschberg, …) is the caller's res
 tate = "0.1"
 ```
 
-### Inline highlights from any line-diff
+### Complete text diff pipeline
 
 ```rust
-use tate::inline::{pair_replacements, Op, OpType, DEFAULT_SIMILARITY};
+use tate::lines::diff;
+use tate::inline::{pair_replacements, OpType, DEFAULT_SIMILARITY};
 
-// Your line-diff engine produces Equal/Delete/Insert ops:
-let raw = vec![
-    Op::delete(1, "Section A.1 Overview .... 17"),
-    Op::insert(1, "Section A.1 Overview .... 18"),
-];
+let a = vec!["hello world".into(), "foo bar".into()];
+let b = vec!["hello world".into(), "foo baz".into()];
 
-// tate pairs similar delete+insert blocks into Replace with word-level segments:
-let ops = pair_replacements(raw, DEFAULT_SIMILARITY);
-assert_eq!(ops.len(), 1);
-assert_eq!(ops[0].typ, OpType::Replace);
+let ops = diff(&a, &b);
+let paired = pair_replacements(ops, DEFAULT_SIMILARITY);
+assert_eq!(paired[1].typ, OpType::Replace);
 ```
 
 ### 2D grid alignment
@@ -94,7 +93,7 @@ assert_eq!(diff.changes.len(), 1);
 
 - **Configurable.** Every heuristic (header detection ratio, row similarity threshold, LCS row budget, identity attributes) is exposed via `GridOptions` / `TreeOptions` with sensible defaults.
 
-- **Tested.** 37 unit tests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, custom identity attributes, root tag rename detection, asymmetric grid widths).
+- **Tested.** 43 unit tests + 2 doctests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, custom identity attributes, root tag rename detection, asymmetric grid widths, 300K-line diff without OOM).
 
 ## License
 

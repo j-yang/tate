@@ -106,6 +106,9 @@ pub struct GridOptions {
     /// `Modified` (fraction of cells equal over the aligned common columns).
     /// 0.5 = "at least half the cells match".
     pub row_similarity_threshold: f64,
+    /// When true, `GridColumn.name` uses the detected header text (e.g.
+    /// "Variable Name"); when false, uses Excel-style letters (e.g. "A").
+    pub use_header_names: bool,
 }
 
 impl Default for GridOptions {
@@ -114,6 +117,7 @@ impl Default for GridOptions {
             lcs_row_budget: 4_000,
             header_fill_ratio: 0.8,
             row_similarity_threshold: 0.5,
+            use_header_names: true,
         }
     }
 }
