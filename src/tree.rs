@@ -9,20 +9,24 @@
 //!    identity drawn from the first present attribute in
 //!    [`TreeOptions::identity_attrs`], falling back to the tag name for
 //!    keyless nodes (positional pairing).
-//! 3. For matched nodes: compare attributes and text; recurse into children.
+//! 3. For matched nodes: compare tag names, attributes, and text; recurse
+//!    into children.
 //! 4. For unmatched nodes: emit `Added` / `Removed`, recursively surfacing
 //!    their identity-bearing descendants.
 //! 5. A change in a keyless descendant bubbles up to the nearest identity-bearing
 //!    ancestor (which is what appears in the change list).
 
 use roxmltree::Document;
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+#[cfg(feature = "serde")]
+use serde::{Deserialize, Serialize};
 
 /// Kind of tree change. `Modified` means the node matched on identity but its
 /// attributes, text, or descendants changed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum ChangeKind {
     Added,
     Removed,
@@ -31,44 +35,45 @@ pub enum ChangeKind {
 
 /// One attribute change: `name`, the old value (or empty when added), and the
 /// new value (or empty when removed).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct AttrChange {
     pub name: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub old: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub new: String,
 }
 
 /// One changed node: its kind, identity, and what changed. No schema-specific
 /// fields — applications layer domain semantics on top.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeChange {
     pub kind: ChangeKind,
     /// Local tag name of the element (e.g. "entry", "group", "div").
-    #[serde(rename = "elemType")]
+    #[cfg_attr(feature = "serde", serde(rename = "elemType"))]
     pub elem_type: String,
     /// Value of the first identity attribute present on the node, or empty when
     /// the node carries none. Applications use this to anchor a highlight in
     /// their own view; tate does not interpret it.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub id: String,
     /// Human-readable label: typically the value of the `name` attribute when
     /// present, falling back to `id`. Empty when neither is set.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub label: String,
     /// Attribute changes for a `Modified` node; empty for `Added` / `Removed`.
-    #[serde(rename = "changedAttrs", default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "serde", serde(rename = "changedAttrs", default, skip_serializing_if = "Vec::is_empty"))]
     pub changed_attrs: Vec<AttrChange>,
 }
 
-/// The result of tree-diffing two documents: the changes and any parse notes.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+/// The result of tree-diffing two documents.
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeDiff {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub changes: Vec<TreeChange>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub notes: Vec<String>,
 }
 
 /// Configuration for [`tree_diff_with`]. Controls which attributes are treated
@@ -103,8 +108,16 @@ pub fn tree_diff_with(xml_a: &str, xml_b: &str, opts: &TreeOptions) -> Result<Tr
     let da = Document::parse(xml_a).map_err(|e| format!("parse A: {e}"))?;
     let db = Document::parse(xml_b).map_err(|e| format!("parse B: {e}"))?;
     let mut changes = Vec::new();
-    diff_node(da.root_element(), db.root_element(), &mut changes, opts);
-    Ok(TreeDiff { changes, notes: Vec::new() })
+    let changed = diff_node(da.root_element(), db.root_element(), &mut changes, opts);
+    // Root is the top of the bubble chain — if it changed but wasn't locatable
+    // (no identity attr), nothing was reported. Surface it so tag renames and
+    // text changes on the root are not silently lost.
+    if changed && changes.is_empty() {
+        let b_root = db.root_element();
+        let attr_changes = attr_diffs(da.root_element(), b_root);
+        changes.push(mk_change(ChangeKind::Modified, b_root, attr_changes, opts));
+    }
+    Ok(TreeDiff { changes })
 }
 
 /// First present identity attribute on `n`, as `(attr_name, value)`.
@@ -193,7 +206,8 @@ fn diff_node(a: roxmltree::Node, b: roxmltree::Node, out: &mut Vec<TreeChange>, 
     let locatable = node_is_locatable(b, opts);
     let attr_changes = attr_diffs(a, b);
     let text_changed = direct_text(a) != direct_text(b);
-    let mut own_changed = !attr_changes.is_empty() || text_changed;
+    let tag_changed = local_tag(a) != local_tag(b);
+    let mut own_changed = tag_changed || !attr_changes.is_empty() || text_changed;
 
     let a_children: Vec<roxmltree::Node> = a.children().filter(|c| c.is_element()).collect();
     let b_children: Vec<roxmltree::Node> = b.children().filter(|c| c.is_element()).collect();
@@ -300,8 +314,6 @@ mod tests {
 
     #[test]
     fn keyless_descendant_bubbles_up() {
-        // A node with identity (id) holds a keyless child (an <option> with no
-        // identity attr). The change in the child must surface on the parent.
         let a = r#"<root><group id="g1" name="G"><option value="A"/></group></root>"#;
         let b = r#"<root><group id="g1" name="G"><option value="B"/></group></root>"#;
         let d = tree_diff(a, b).unwrap();
@@ -324,19 +336,19 @@ mod tests {
     }
 
     #[test]
+    fn root_tag_rename_is_detected() {
+        let a = r#"<foo/>"#;
+        let b = r#"<bar/>"#;
+        let d = tree_diff(a, b).unwrap();
+        assert!(!d.changes.is_empty(), "root tag rename must be detected");
+    }
+
+    #[test]
     fn custom_identity_attrs() {
-        // A schema that uses `ref` instead of `id` for identity: with default
-        // options nothing is locatable so the entries appear as positional
-        // (modifications bubble through); with TreeOptions we get clean matches.
         let a = r#"<root><node ref="x"/><node ref="y"/></root>"#;
         let b = r#"<root><node ref="y"/><node ref="x"/></root>"#;
-        // Default: ref is not an identity attr → both nodes match by tag only,
-        // paired positionally, each subtree equal → no changes.
-        let d_default = tree_diff(a, b).unwrap();
-        assert!(d_default.changes.is_empty());
 
-        // Custom: declare ref as identity so reordering is matched by key.
-        // (Still no changes — identity matching just makes it more robust.)
+        // With ref as identity: reordering is matched by key, no changes.
         let opts = TreeOptions { identity_attrs: vec!["ref".to_string()] };
         let d_custom = tree_diff_with(a, b, &opts).unwrap();
         assert!(d_custom.changes.is_empty());

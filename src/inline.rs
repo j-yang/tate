@@ -7,7 +7,7 @@
 //! delete-then-insert pair — visually noisy. [`pair_replacements`] walks the
 //! script and merges adjacent delete/insert pairs that are similar enough
 //! into a single [`Op`] with `typ = Replace` carrying inline segments
-//! (`a_segs` / `b_segs`), so your UI can highlight only the changed word.
+//! (`old_segs` / `new_segs`), so your UI can highlight only the changed word.
 //!
 //! [`inline_segments`] does the same word-level alignment for one pair of lines
 //! in isolation, usable on its own (e.g. a structured UI that already knows
@@ -15,13 +15,16 @@
 //! DP over alphanumeric tokens — bounded and tiny for single lines, so no
 //! patience anchoring or Hirschberg reduction is needed.
 
-use crate::lcs::{char_similarity, lcs_diff, tokenize};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+use crate::lcs::{char_similarity, lcs_diff, tokenize};
 
 /// Op type emitted by a line-diff engine. `Replace` is never produced by raw
 /// line-diff; it appears only after [`pair_replacements`] post-processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum OpType {
     Equal,
     Delete,
@@ -31,25 +34,27 @@ pub enum OpType {
 
 /// One edit operation between two line sequences.
 ///
-/// `a` / `b` are 1-based indices into the A/B source slices (0 = absent on that
-/// side, for Insert / Delete). `a_val` / `b_val` carry the source text; for
-/// `Equal` they are equal, for `Delete` `b_val` is empty, and so on. `a_segs` /
-/// `b_segs` are populated only for [`OpType::Replace`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// `a` / `b` are 1-based indices into the old/new source slices (0 = absent on
+/// that side, for Insert / Delete). `old` / `new` carry the source text; for
+/// `Equal` they are equal, for `Delete` `new` is empty, for `Insert` `old` is
+/// empty. `old_segs` / `new_segs` are populated only for [`OpType::Replace`].
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Op {
     pub typ: OpType,
     pub a: usize,
     pub b: usize,
-    pub a_val: String,
-    pub b_val: String,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub a_segs: Vec<Seg>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub b_segs: Vec<Seg>,
+    pub old: String,
+    pub new: String,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub old_segs: Vec<Seg>,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub new_segs: Vec<Seg>,
 }
 
 /// A word/token-level inline segment with its "changed vs the other side" flag.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Seg {
     pub text: String,
     pub changed: bool,
@@ -62,51 +67,58 @@ pub struct Seg {
 pub const DEFAULT_SIMILARITY: f64 = 0.5;
 
 impl Op {
-    pub fn equal(a: usize, b: usize, av: &str, bv: &str) -> Self {
+    pub fn equal(a: usize, b: usize, old: &str, new: &str) -> Self {
         Op {
             typ: OpType::Equal,
             a,
             b,
-            a_val: av.to_string(),
-            b_val: bv.to_string(),
-            a_segs: Vec::new(),
-            b_segs: Vec::new(),
+            old: old.to_string(),
+            new: new.to_string(),
+            old_segs: Vec::new(),
+            new_segs: Vec::new(),
         }
     }
 
-    pub fn insert(b: usize, bv: &str) -> Self {
+    pub fn insert(b: usize, new: &str) -> Self {
         Op {
             typ: OpType::Insert,
             a: 0,
             b,
-            a_val: String::new(),
-            b_val: bv.to_string(),
-            a_segs: Vec::new(),
-            b_segs: Vec::new(),
+            old: String::new(),
+            new: new.to_string(),
+            old_segs: Vec::new(),
+            new_segs: Vec::new(),
         }
     }
 
-    pub fn delete(a: usize, av: &str) -> Self {
+    pub fn delete(a: usize, old: &str) -> Self {
         Op {
             typ: OpType::Delete,
             a,
             b: 0,
-            a_val: av.to_string(),
-            b_val: String::new(),
-            a_segs: Vec::new(),
-            b_segs: Vec::new(),
+            old: old.to_string(),
+            new: String::new(),
+            old_segs: Vec::new(),
+            new_segs: Vec::new(),
         }
     }
 
-    pub fn replace(a: usize, b: usize, av: &str, bv: &str, a_segs: Vec<Seg>, b_segs: Vec<Seg>) -> Self {
+    pub fn replace(
+        a: usize,
+        b: usize,
+        old: &str,
+        new: &str,
+        old_segs: Vec<Seg>,
+        new_segs: Vec<Seg>,
+    ) -> Self {
         Op {
             typ: OpType::Replace,
             a,
             b,
-            a_val: av.to_string(),
-            b_val: bv.to_string(),
-            a_segs,
-            b_segs,
+            old: old.to_string(),
+            new: new.to_string(),
+            old_segs,
+            new_segs,
         }
     }
 }
@@ -143,8 +155,8 @@ pub fn pair_replacements(ops: Vec<Op>, threshold: f64) -> Vec<Op> {
         for k in 0..pairs {
             let d = &dels[k];
             let s = &inss[k];
-            if let Some((a_segs, b_segs)) = inline_segments(&d.a_val, &s.b_val, threshold) {
-                out.push(Op::replace(d.a, s.b, &d.a_val, &s.b_val, a_segs, b_segs));
+            if let Some((old_segs, new_segs)) = inline_segments(&d.old, &s.new, threshold) {
+                out.push(Op::replace(d.a, s.b, &d.old, &s.new, old_segs, new_segs));
             } else {
                 out.push(d.clone());
                 out.push(s.clone());
@@ -161,7 +173,7 @@ pub fn pair_replacements(ops: Vec<Op>, threshold: f64) -> Vec<Op> {
 }
 
 /// Compute word-level inline highlight segments for two lines, returning
-/// `(a_segs, b_segs)`. Returns `None` when the lines are below `threshold`
+/// `(old_segs, new_segs)`. Returns `None` when the lines are below `threshold`
 /// similar — caller should show them as a delete + insert rather than a Replace.
 ///
 /// Tokenization splits on alphanumeric runs, so `Section A.1 ... 17` and
@@ -176,7 +188,7 @@ pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Ve
     let mut equal_chars = 0usize;
     for op in &ops {
         if op.typ == OpType::Equal {
-            equal_chars += op.a_val.chars().count();
+            equal_chars += op.old.chars().count();
         }
     }
     let similarity = char_similarity(equal_chars, a.chars().count(), b.chars().count());
@@ -184,8 +196,8 @@ pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Ve
         return None;
     }
 
-    let mut a_segs: Vec<Seg> = Vec::new();
-    let mut b_segs: Vec<Seg> = Vec::new();
+    let mut old_segs: Vec<Seg> = Vec::new();
+    let mut new_segs: Vec<Seg> = Vec::new();
     let push = |segs: &mut Vec<Seg>, text: &str, changed: bool| {
         if text.is_empty() {
             return;
@@ -201,15 +213,15 @@ pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Ve
     for op in &ops {
         match op.typ {
             OpType::Equal => {
-                push(&mut a_segs, &op.a_val, false);
-                push(&mut b_segs, &op.b_val, false);
+                push(&mut old_segs, &op.old, false);
+                push(&mut new_segs, &op.new, false);
             }
-            OpType::Delete => push(&mut a_segs, &op.a_val, true),
-            OpType::Insert => push(&mut b_segs, &op.b_val, true),
+            OpType::Delete => push(&mut old_segs, &op.old, true),
+            OpType::Insert => push(&mut new_segs, &op.new, true),
             OpType::Replace => {}
         }
     }
-    Some((a_segs, b_segs))
+    Some((old_segs, new_segs))
 }
 
 #[cfg(test)]
@@ -225,10 +237,10 @@ mod tests {
         let out = pair_replacements(ops, DEFAULT_SIMILARITY);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].typ, OpType::Replace);
-        let a_chg: String = out[0].a_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
-        let b_chg: String = out[0].b_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
-        assert_eq!(a_chg, "17");
-        assert_eq!(b_chg, "18");
+        let old_chg: String = out[0].old_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
+        let new_chg: String = out[0].new_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
+        assert_eq!(old_chg, "17");
+        assert_eq!(new_chg, "18");
     }
 
     #[test]
@@ -245,28 +257,28 @@ mod tests {
 
     #[test]
     fn inline_only_marks_changed_word() {
-        let (a_segs, b_segs) =
+        let (old_segs, new_segs) =
             inline_segments("foo bar", "foo baz", DEFAULT_SIMILARITY).expect("similar enough");
-        let a_changed: String = a_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
-        let b_changed: String = b_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
-        assert_eq!(a_changed, "bar");
-        assert_eq!(b_changed, "baz");
+        let old_changed: String = old_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
+        let new_changed: String = new_segs.iter().filter(|s| s.changed).map(|s| s.text.clone()).collect();
+        assert_eq!(old_changed, "bar");
+        assert_eq!(new_changed, "baz");
     }
 
     #[test]
     fn scattered_number_changes_word_level() {
         let a = "ROW01 12 0.0617 0.020 0.0400 0.075";
         let b = "ROW01 15 0.0580 0.020 0.0400 0.075";
-        let (a_segs, b_segs) = inline_segments(a, b, DEFAULT_SIMILARITY).expect("similar enough");
-        assert_eq!(a_segs.len(), b_segs.len());
-        let b_changed: Vec<String> = b_segs
+        let (old_segs, new_segs) = inline_segments(a, b, DEFAULT_SIMILARITY).expect("similar enough");
+        assert_eq!(old_segs.len(), new_segs.len());
+        let new_changed: Vec<String> = new_segs
             .iter()
             .filter(|s| s.changed)
             .map(|s| s.text.trim().to_string())
             .collect();
-        assert!(b_changed.iter().any(|s| s.contains("15")));
-        assert!(b_changed.iter().any(|s| s.contains("0580")));
-        let unchanged: String = b_segs.iter().filter(|s| !s.changed).map(|s| s.text.clone()).collect();
+        assert!(new_changed.iter().any(|s| s.contains("15")));
+        assert!(new_changed.iter().any(|s| s.contains("0580")));
+        let unchanged: String = new_segs.iter().filter(|s| !s.changed).map(|s| s.text.clone()).collect();
         assert!(unchanged.contains("0.0400"));
     }
 

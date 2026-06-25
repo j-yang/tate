@@ -88,13 +88,13 @@ assert_eq!(diff.changes.len(), 1);
 
 ## Design
 
-- **Self-contained.** Zero external diff-engine dependencies. The only crate dependencies are `serde` (optional serialization) and `roxmltree` (XML parsing for `tree`).
+- **Self-contained.** Zero external diff-engine dependencies. The only crate dependencies are `roxmltree` (XML parsing for `tree`) and `serde` (optional, behind the default `serde` feature).
 
 - **Format-agnostic.** `grid_diff` accepts `&[Vec<String>]` — it doesn't know whether rows came from Excel, CSV, or a database query. `tree_diff` outputs generic `TreeChange` with no schema-specific fields.
 
 - **Configurable.** Every heuristic (header detection ratio, row similarity threshold, LCS row budget, identity attributes) is exposed via `GridOptions` / `TreeOptions` with sensible defaults.
 
-- **Tested.** 34 unit tests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, custom identity attributes).
+- **Tested.** 37 unit tests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, custom identity attributes, root tag rename detection, asymmetric grid widths).
 
 ## License
 

@@ -19,13 +19,16 @@
 //! 5. For each row slot, render cells from each side through the column slots
 //!    and tag `equal | modified | added | removed` per cell.
 
-use crate::inline::OpType;
-use crate::lcs::lcs_diff;
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::inline::OpType;
+use crate::lcs::lcs_diff;
+
 /// Status of one cell, row, or column in the aligned grid.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum Status {
     Equal,
     Modified,
@@ -33,20 +36,22 @@ pub enum Status {
     Removed,
 }
 
-/// One diffed cell: status plus the A and B text (either may be empty when the
-/// cell only exists on one side).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One diffed cell: status plus the old and new text (either may be empty when
+/// the cell only exists on one side).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CellChange {
     pub status: Status,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub old: String,
-    #[serde(default, skip_serializing_if = "String::is_empty", rename = "new")]
-    pub new_val: String,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub new: String,
 }
 
-/// One aligned column slot: its name (Excel-style letter) and its status across
-/// the two sides.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// One aligned column slot: its display name and its status across the two
+/// sides.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct GridColumn {
     pub name: String,
     pub status: Status,
@@ -54,19 +59,21 @@ pub struct GridColumn {
 
 /// One aligned row: its status and source-row pointers (1-based, 0 = absent).
 /// `header` flags the detected header row for the UI.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct GridRow {
     pub status: Status,
-    #[serde(rename = "rowA")]
+    #[cfg_attr(feature = "serde", serde(rename = "rowA"))]
     pub row_a: usize,
-    #[serde(rename = "rowB")]
+    #[cfg_attr(feature = "serde", serde(rename = "rowB"))]
     pub row_b: usize,
     pub header: bool,
     pub cells: Vec<CellChange>,
 }
 
 /// The result of diffing two grids: aligned columns, rows, and per-cell status.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct GridDiff {
     pub columns: Vec<GridColumn>,
     pub rows: Vec<GridRow>,
@@ -77,27 +84,24 @@ pub struct GridDiff {
     pub removed_cols: usize,
     /// Operational notes surfaced to the UI (e.g. "row budget exceeded,
     /// positional alignment used").
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub notes: Vec<String>,
 }
 
 /// Configuration for [`grid_diff`]. Every knob is exposed so callers can adapt
 /// the heuristics to non-table-shaped grids (sparse ledgers, wide pivots,
 /// dense reports, …).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(default))]
 pub struct GridOptions {
-    /// Hard cap on rows considered. Callers should truncate input beyond this.
-    pub max_rows: usize,
-    /// Hard cap on columns considered per row. Callers should truncate.
-    pub max_cols: usize,
     /// Row alignment is abandoned at this total row count (A or B) for
     /// performance; rows past the budget are paired positionally. Raise for
     /// server use, lower for interactive previews.
     pub lcs_row_budget: usize,
     /// A row is considered a header if it fills ≥ `header_fill_ratio` of the
     /// grid width. 0.8 matches a moderately dense CSV-with-title layout.
-    pub header_fill_ratio: f32,
+    pub header_fill_ratio: f64,
     /// Similarity threshold for promoting a leftover del+ins row pair to
     /// `Modified` (fraction of cells equal over the aligned common columns).
     /// 0.5 = "at least half the cells match".
@@ -107,8 +111,6 @@ pub struct GridOptions {
 impl Default for GridOptions {
     fn default() -> Self {
         GridOptions {
-            max_rows: 50_000,
-            max_cols: 256,
             lcs_row_budget: 4_000,
             header_fill_ratio: 0.8,
             row_similarity_threshold: 0.5,
@@ -120,8 +122,7 @@ impl Default for GridOptions {
 ///
 /// `rows_a` / `rows_b` are arbitrary `&[Vec<String>]`; they typically come from
 /// parsing xlsx/CSV/HTML/SQL/etc., but `grid_diff` doesn't know or care. Each
-/// row is one record; each cell is already stringified. Rows beyond
-/// [`GridOptions::max_rows`] should be truncated by the caller.
+/// row is one record; each cell is already stringified.
 pub fn grid_diff(
     rows_a: &[Vec<String>],
     rows_b: &[Vec<String>],
@@ -129,12 +130,14 @@ pub fn grid_diff(
 ) -> GridDiff {
     let width_a = max_width(rows_a);
     let width_b = max_width(rows_b);
-    let width = width_a.max(width_b);
 
-    let header_a = detect_header_row(rows_a, width, opts.header_fill_ratio);
-    let header_b = detect_header_row(rows_b, width, opts.header_fill_ratio);
+    let header_a = detect_header_row(rows_a, width_a, opts.header_fill_ratio);
+    let header_b = detect_header_row(rows_b, width_b, opts.header_fill_ratio);
 
     let slots = align_columns(rows_a, rows_b, width_a, width_b, header_a, header_b);
+
+    let head_a: &[String] = if header_a > 0 { &rows_a[header_a - 1] } else { &[] };
+    let head_b: &[String] = if header_b > 0 { &rows_b[header_b - 1] } else { &[] };
 
     let mut gd = GridDiff {
         columns: Vec::with_capacity(slots.len()),
@@ -146,7 +149,8 @@ pub fn grid_diff(
             (true, false) => { gd.removed_cols += 1; Status::Removed }
             _ => Status::Equal,
         };
-        gd.columns.push(GridColumn { name: col_letter(k), status });
+        let name = column_display_name(k, slot, head_a, head_b);
+        gd.columns.push(GridColumn { name, status });
     }
 
     let row_pairs = align_rows(rows_a, rows_b, &slots, opts, &mut gd);
@@ -175,11 +179,11 @@ fn max_width(rows: &[Vec<String>]) -> usize {
 /// detect_header_row returns the 1-based index of the row that most likely is
 /// the table header: the first row filling ≥ `header_fill_ratio` of the width.
 /// 0 if none.
-fn detect_header_row(rows: &[Vec<String>], width: usize, ratio: f32) -> usize {
+fn detect_header_row(rows: &[Vec<String>], width: usize, ratio: f64) -> usize {
     if width < 2 {
         return 0;
     }
-    let threshold = ((width as f32 * ratio) + 0.5) as usize;
+    let threshold = ((width as f64 * ratio) + 0.5) as usize;
     let mut best_row = 0;
     let mut best_filled = 0;
     for (i, r) in rows.iter().enumerate() {
@@ -193,7 +197,7 @@ fn detect_header_row(rows: &[Vec<String>], width: usize, ratio: f32) -> usize {
 }
 
 /// Convert a 0-based column index to its Excel-style letter (0 -> A, 25 -> Z,
-/// 26 -> AA). Useful for display names when the source format has no header.
+/// 26 -> AA). Used as a fallback display name when no header text is available.
 pub fn col_letter(mut i: usize) -> String {
     let mut b: Vec<u8> = Vec::new();
     i += 1;
@@ -203,6 +207,22 @@ pub fn col_letter(mut i: usize) -> String {
         i /= 26;
     }
     String::from_utf8(b).unwrap()
+}
+
+/// Pick a human-readable name for an aligned column slot: prefer the source
+/// header text (B's, then A's), falling back to the Excel-style letter.
+fn column_display_name(k: usize, slot: &ColSlot, head_a: &[String], head_b: &[String]) -> String {
+    let from_b = if slot.b >= 0 {
+        head_b.get(slot.b as usize).map(|s| s.trim()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let from_a = if slot.a >= 0 {
+        head_a.get(slot.a as usize).map(|s| s.trim()).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    from_b.or(from_a).map(|s| s.to_string()).unwrap_or_else(|| col_letter(k))
 }
 
 /// One column slot in the aligned grid. `a`/`b` are 0-based source column
@@ -442,19 +462,19 @@ fn build_grid_row(rp: RowPair, rows_a: &[Vec<String>], rows_b: &[Vec<String>], s
         let va = get(ra, slot.a);
         let vb = get(rb, slot.b);
         let cc = if slot.b < 0 {
-            CellChange { status: Status::Removed, old: va, new_val: String::new() }
+            CellChange { status: Status::Removed, old: va, new: String::new() }
         } else if slot.a < 0 {
-            CellChange { status: Status::Added, old: String::new(), new_val: vb }
+            CellChange { status: Status::Added, old: String::new(), new: vb }
         } else {
             match row_status {
-                Status::Added => CellChange { status: Status::Added, old: String::new(), new_val: vb },
-                Status::Removed => CellChange { status: Status::Removed, old: va, new_val: String::new() },
+                Status::Added => CellChange { status: Status::Added, old: String::new(), new: vb },
+                Status::Removed => CellChange { status: Status::Removed, old: va, new: String::new() },
                 _ => {
                     if va != vb {
                         modified = true;
-                        CellChange { status: Status::Modified, old: va, new_val: vb }
+                        CellChange { status: Status::Modified, old: va, new: vb }
                     } else {
-                        CellChange { status: Status::Equal, old: String::new(), new_val: vb }
+                        CellChange { status: Status::Equal, old: String::new(), new: vb }
                     }
                 }
             }
@@ -538,8 +558,8 @@ mod tests {
         ]);
         let gd = grid_diff(&a, &b, &GridOptions::default());
         assert_eq!(gd.columns.len(), 4, "want 4 columns");
-        assert_eq!(gd.columns[0].name, "A");
-        assert_eq!(gd.columns[3].name, "D");
+        assert_eq!(gd.columns[0].name, "Sku");
+        assert_eq!(gd.columns[3].name, "Stock");
         let (a_n, r, m, e) = counts(&gd);
         assert_eq!((m, a_n, r), (1, 0, 0));
         assert_eq!(e, 5);
@@ -548,7 +568,7 @@ mod tests {
                 assert_eq!(row.cells.len(), 4);
                 assert_eq!(row.cells[3].status, Status::Modified);
                 assert_eq!(row.cells[3].old, "20");
-                assert_eq!(row.cells[3].new_val, "21");
+                assert_eq!(row.cells[3].new, "21");
             }
         }
     }
@@ -600,5 +620,22 @@ mod tests {
         let gd = grid_diff(&big_a, &big_b, &opts);
         assert!(!gd.notes.is_empty(), "expected a fallback note");
         assert!(gd.notes.iter().any(|n| n.contains("position")), "note should mention positional: {:?}", gd.notes);
+    }
+
+    #[test]
+    fn asymmetric_widths_detect_header_independently() {
+        let a = grid(&[&["h1", "h2", "h3", "h4"], &["1", "2", "3", "4"]]);
+        let b = grid(&[&["h1"], &["1"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        assert!(gd.rows.iter().any(|r| r.header), "header should be detected on both sides independently");
+    }
+
+    #[test]
+    fn column_names_use_header_text_when_available() {
+        let a = grid(&[&["Name", "Value"], &["x", "1"]]);
+        let b = grid(&[&["Name", "Value"], &["x", "2"]]);
+        let gd = grid_diff(&a, &b, &GridOptions::default());
+        assert_eq!(gd.columns[0].name, "Name");
+        assert_eq!(gd.columns[1].name, "Value");
     }
 }
