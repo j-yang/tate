@@ -82,12 +82,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "similar"
-version = "3.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6505efef05804732ed8a3f2d4f279429eb485bd69d5b0cc6b19cc02005cda16"
-
-[[package]]
 name = "syn"
 version = "2.0.118"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,7 +99,6 @@ dependencies = [
  "roxmltree",
  "serde",
  "serde_json",
- "similar",
 ]
 
 [[package]]

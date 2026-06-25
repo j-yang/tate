@@ -1,25 +1,26 @@
 //! 2D grid alignment: take two tables of strings and produce one aligned grid
 //! with cell-, row-, and column-level change status. Format-agnostic — it has
-//! no knowledge of Excel, CSV, RTF or any particular file format; callers parse
-//! their format into `&[Vec<String>]` and hand the grid to [`grid_diff`].
+//! no knowledge of any particular file format; callers parse their format
+//! (Excel, CSV, HTML tables, SQL result sets, …) into `&[Vec<String>]` and hand
+//! the grid to [`grid_diff`].
 //!
-//! Algorithm (ported from `shtuka-core/src/excel.rs`, sans the ExcelResult
-//! / sheet-union wrapper):
+//! Algorithm:
 //! 1. Detect the header row on each side (the first row that fills ≥
 //!    [`GridOptions::header_fill_ratio`] of the width).
-//! 2. Run a line-diff over the header cells to align columns, producing a slot
+//! 2. Run an LCS diff over the header cells to align columns, producing a slot
 //!    list mapping each output column to (a_col, b_col); a slot with one side
 //!    missing means an added/removed column.
-//! 3. Run a line-diff over row signatures (cells joined by a separator) to
-//!    align rows, with an [`GridOptions::lcs_row_budget`] cap beyond which rows
-//!    are aligned positionally.
+//! 3. Run an LCS diff over row signatures (aligned-column cells joined by a
+//!    separator) to align rows, with an [`GridOptions::lcs_row_budget`] cap
+//!    beyond which rows are aligned positionally.
 //! 4. For each unpaired delete/insert pair left over, check row similarity and
 //!    promote to `modified` when above threshold (the grid-level analogue of
 //!    [`crate::inline::pair_replacements`]).
 //! 5. For each row slot, render cells from each side through the column slots
 //!    and tag `equal | modified | added | removed` per cell.
 
-use crate::inline::{Op, OpType};
+use crate::inline::OpType;
+use crate::lcs::lcs_diff;
 use serde::{Deserialize, Serialize};
 
 /// Status of one cell, row, or column in the aligned grid.
@@ -30,17 +31,6 @@ pub enum Status {
     Modified,
     Added,
     Removed,
-}
-
-impl Status {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Status::Equal => "equal",
-            Status::Modified => "modified",
-            Status::Added => "added",
-            Status::Removed => "removed",
-        }
-    }
 }
 
 /// One diffed cell: status plus the A and B text (either may be empty when the
@@ -54,8 +44,8 @@ pub struct CellChange {
     pub new_val: String,
 }
 
-/// One aligned column slot: its name (Excel-style letter or 0-based index) and
-/// its status across the two sides.
+/// One aligned column slot: its name (Excel-style letter) and its status across
+/// the two sides.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GridColumn {
     pub name: String,
@@ -85,34 +75,33 @@ pub struct GridDiff {
     pub modified_rows: usize,
     pub added_cols: usize,
     pub removed_cols: usize,
-    /// Operational notes (e.g. "row count exceeded budget, positional alignment").
+    /// Operational notes surfaced to the UI (e.g. "row budget exceeded,
+    /// positional alignment used").
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notes: Vec<String>,
 }
 
-/// Configuration for [`grid_diff`]. Defaults match the clinical-Excel heuristics
-/// the algorithm was tuned for, but every knob is exposed so non-Excel callers
-/// (small CSVs, very large SQL result sets, sparse ledgers) can override.
+/// Configuration for [`grid_diff`]. Every knob is exposed so callers can adapt
+/// the heuristics to non-table-shaped grids (sparse ledgers, wide pivots,
+/// dense reports, …).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GridOptions {
-    /// Hard cap on rows considered. Above this the caller should truncate.
+    /// Hard cap on rows considered. Callers should truncate input beyond this.
     pub max_rows: usize,
-    /// Hard cap on columns considered per row. Above this the caller should truncate.
+    /// Hard cap on columns considered per row. Callers should truncate.
     pub max_cols: usize,
-    /// Row alignment is abandoned at this total row count (A+B) for performance;
-    /// rows past the budget are paired positionally. Raise for server use.
+    /// Row alignment is abandoned at this total row count (A or B) for
+    /// performance; rows past the budget are paired positionally. Raise for
+    /// server use, lower for interactive previews.
     pub lcs_row_budget: usize,
     /// A row is considered a header if it fills ≥ `header_fill_ratio` of the
-    /// grid width. 0.8 matches the default the Excel engine was tuned with.
+    /// grid width. 0.8 matches a moderately dense CSV-with-title layout.
     pub header_fill_ratio: f32,
     /// Similarity threshold for promoting a leftover del+ins row pair to
-    /// `Modified`. 0.5 matches ROW87_W_LIGHT's explicit default.
+    /// `Modified` (fraction of cells equal over the aligned common columns).
+    /// 0.5 = "at least half the cells match".
     pub row_similarity_threshold: f64,
-    /// Threshold passed to [`inline_segments`] when the caller wants word-level
-    /// cell-level highlights (not used in `grid_diff` itself today, but reserved
-    /// for the common pattern of pairing cells with inline segments).
-    pub inline_threshold: f64,
 }
 
 impl Default for GridOptions {
@@ -123,7 +112,6 @@ impl Default for GridOptions {
             lcs_row_budget: 4_000,
             header_fill_ratio: 0.8,
             row_similarity_threshold: 0.5,
-            inline_threshold: 0.5,
         }
     }
 }
@@ -131,7 +119,7 @@ impl Default for GridOptions {
 /// Diff two string grids and produce one aligned grid.
 ///
 /// `rows_a` / `rows_b` are arbitrary `&[Vec<String>]`; they typically come from
-/// parsing xlsx/CSV/RTF/SQL/etc., but `grid_diff` doesn't know or care. Each
+/// parsing xlsx/CSV/HTML/SQL/etc., but `grid_diff` doesn't know or care. Each
 /// row is one record; each cell is already stringified. Rows beyond
 /// [`GridOptions::max_rows`] should be truncated by the caller.
 pub fn grid_diff(
@@ -148,9 +136,10 @@ pub fn grid_diff(
 
     let slots = align_columns(rows_a, rows_b, width_a, width_b, header_a, header_b);
 
-    let mut gd = GridDiff::default();
-
-    gd.columns = Vec::with_capacity(slots.len());
+    let mut gd = GridDiff {
+        columns: Vec::with_capacity(slots.len()),
+        ..Default::default()
+    };
     for (k, slot) in slots.iter().enumerate() {
         let status = match (slot.a >= 0, slot.b >= 0) {
             (false, true) => { gd.added_cols += 1; Status::Added }
@@ -160,7 +149,7 @@ pub fn grid_diff(
         gd.columns.push(GridColumn { name: col_letter(k), status });
     }
 
-    let row_pairs = align_rows(rows_a, rows_b, &slots, opts);
+    let row_pairs = align_rows(rows_a, rows_b, &slots, opts, &mut gd);
 
     for rp in &row_pairs {
         let mut gr = build_grid_row(*rp, rows_a, rows_b, &slots);
@@ -286,8 +275,13 @@ fn align_rows(
     rows_b: &[Vec<String>],
     slots: &[ColSlot],
     opts: &GridOptions,
+    gd: &mut GridDiff,
 ) -> Vec<RowPair> {
     if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
+        gd.notes.push(format!(
+            "row count exceeds budget ({}); rows matched by position instead of LCS alignment",
+            opts.lcs_row_budget
+        ));
         return align_rows_by_position(rows_a, rows_b);
     }
     align_rows_by_lcs(rows_a, rows_b, slots, opts)
@@ -473,50 +467,6 @@ fn build_grid_row(rp: RowPair, rows_a: &[Vec<String>], rows_b: &[Vec<String>], s
     gr
 }
 
-/// Small O(n*m) LCS DP shared by [`align_columns`] and [`align_rows_by_lcs`].
-/// Inputs are bounded (column headers or row signatures), so the full DP
-/// table is fine; patience anchoring / Hirschberg are the caller's job, not
-/// ours. This is the same helper used by [`crate::inline`], duplicated here to
-/// keep `grid` self-contained without coupling to `inline`'s private internals.
-fn lcs_diff(a: &[String], b: &[String]) -> Vec<Op> {
-    let n = a.len();
-    let m = b.len();
-    if n == 0 {
-        return b.iter().enumerate().map(|(j, s)| Op::insert(j + 1, s)).collect();
-    }
-    if m == 0 {
-        return a.iter().enumerate().map(|(i, s)| Op::delete(i + 1, s)).collect();
-    }
-    let mut dp = vec![vec![0u32; m + 1]; n + 1];
-    for i in 1..=n {
-        for j in 1..=m {
-            if a[i - 1] == b[j - 1] {
-                dp[i][j] = dp[i - 1][j - 1] + 1;
-            } else {
-                dp[i][j] = dp[i - 1][j].max(dp[i][j - 1]);
-            }
-        }
-    }
-    let mut ops: Vec<Op> = Vec::new();
-    let mut i = n;
-    let mut j = m;
-    while i > 0 || j > 0 {
-        if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
-            ops.push(Op::equal(i, j, &a[i - 1], &b[j - 1]));
-            i -= 1;
-            j -= 1;
-        } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
-            ops.push(Op::insert(j, &b[j - 1]));
-            j -= 1;
-        } else {
-            ops.push(Op::delete(i, &a[i - 1]));
-            i -= 1;
-        }
-    }
-    ops.reverse();
-    ops
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -567,22 +517,24 @@ mod tests {
     }
 
     #[test]
-    fn sparse_spec_layout_shows_all_columns() {
+    fn sparse_header_layout_aligns_columns() {
+        // A layout with a title block above the table header: the detector must
+        // still find the real header row and align all four columns.
         let a = grid(&[
-            &["DM Domain Mapping Specifications"],
-            &["Protocol Number:", "", "", "STUDY-DEMO-001"],
+            &["Inventory Report"],
+            &["Region:", "", "", "EMEA"],
             &[],
-            &["Variable Name", "Variable Label", "Type", "Length"],
-            &["STUDYID", "Study Identifier", "C", "20"],
-            &["DOMAIN", "Domain Abbreviation", "C", "2"],
+            &["Sku", "Description", "Category", "Stock"],
+            &["A001", "Widget", "Tools", "20"],
+            &["A002", "Gadget", "Toys", "2"],
         ]);
         let b = grid(&[
-            &["DM Domain Mapping Specifications"],
-            &["Protocol Number:", "", "", "STUDY-DEMO-001"],
+            &["Inventory Report"],
+            &["Region:", "", "", "EMEA"],
             &[],
-            &["Variable Name", "Variable Label", "Type", "Length"],
-            &["STUDYID", "Study Identifier", "C", "21"],
-            &["DOMAIN", "Domain Abbreviation", "C", "2"],
+            &["Sku", "Description", "Category", "Stock"],
+            &["A001", "Widget", "Tools", "21"],
+            &["A002", "Gadget", "Toys", "2"],
         ]);
         let gd = grid_diff(&a, &b, &GridOptions::default());
         assert_eq!(gd.columns.len(), 4, "want 4 columns");
@@ -603,8 +555,8 @@ mod tests {
 
     #[test]
     fn appended_row_is_added() {
-        let a = grid(&[&["Variable Name", "Type"], &["STUDYID", "C"]]);
-        let b = grid(&[&["Variable Name", "Type"], &["STUDYID", "C"], &["AGE", "N"]]);
+        let a = grid(&[&["Sku", "Category"], &["A001", "Tools"]]);
+        let b = grid(&[&["Sku", "Category"], &["A001", "Tools"], &["A002", "Toys"]]);
         let gd = grid_diff(&a, &b, &GridOptions::default());
         let (a_n, r, m, _) = counts(&gd);
         assert_eq!((a_n, r, m), (1, 0, 0));
@@ -634,5 +586,19 @@ mod tests {
         let gd = grid_diff(&a, &b, &GridOptions::default());
         let (a_n, r, m, e) = counts(&gd);
         assert_eq!((a_n, r, m, e), (0, 0, 0, 3));
+    }
+
+    #[test]
+    fn row_budget_falls_back_to_positional_with_note() {
+        let mut big_a: Vec<Vec<String>> = Vec::new();
+        let mut big_b: Vec<Vec<String>> = Vec::new();
+        for i in 0..5 {
+            big_a.push(vec![format!("r{i}"), "x".into()]);
+            big_b.push(vec![format!("r{i}"), "x".into()]);
+        }
+        let opts = GridOptions { lcs_row_budget: 2, ..GridOptions::default() };
+        let gd = grid_diff(&big_a, &big_b, &opts);
+        assert!(!gd.notes.is_empty(), "expected a fallback note");
+        assert!(gd.notes.iter().any(|n| n.contains("position")), "note should mention positional: {:?}", gd.notes);
     }
 }

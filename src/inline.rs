@@ -1,20 +1,21 @@
 //! Inline alignment: turn raw delete/insert edit scripts into Replace ops with
 //! word-level inline highlights.
 //!
-//! A line-diff engine (similar / imara / a hand-rolled one) gives you ops of the
-//! form `Equal | Delete | Insert`. The default rendering of a line that was
-//! edited from `foo bar` to `foo baz` is a delete + an insert — visually noisy.
-//! [`pair_replacements`] walks the script and merges adjacent delete/insert pairs
-//! that are similar enough into a single [`Op`] with `typ = Replace` carrying
-//! inline segments (`a_segs` / `b_segs`), so your UI can highlight only the
-//! changed word.
+//! A line-diff engine (Myers, patience, LCS, Hirschberg — any that emits
+//! `Equal | Delete | Insert` ops) gives you a raw edit script. The default
+//! rendering of a line that was edited from `foo bar` to `foo baz` is a
+//! delete-then-insert pair — visually noisy. [`pair_replacements`] walks the
+//! script and merges adjacent delete/insert pairs that are similar enough
+//! into a single [`Op`] with `typ = Replace` carrying inline segments
+//! (`a_segs` / `b_segs`), so your UI can highlight only the changed word.
 //!
-//! [`inline_segments`] does the same word-level alignment for one pair of lines,
-//! usable on its own (e.g. when you already know which two lines to compare, as
-//! the RTF cell highlighter does). It uses a small internal LCS DP — line-level
-//! diff is your job (feed the result into [`pair_replacements`]), but word-level
-//! diff on a single pair of lines is tiny and bounded, so we bundle it.
+//! [`inline_segments`] does the same word-level alignment for one pair of lines
+//! in isolation, usable on its own (e.g. a structured UI that already knows
+//! which two cells to compare). Word-level diffing uses a small internal LCS
+//! DP over alphanumeric tokens — bounded and tiny for single lines, so no
+//! patience anchoring or Hirschberg reduction is needed.
 
+use crate::lcs::{char_similarity, lcs_diff, tokenize};
 use serde::{Deserialize, Serialize};
 
 /// Op type emitted by a line-diff engine. `Replace` is never produced by raw
@@ -57,7 +58,7 @@ pub struct Seg {
 /// Default similarity threshold: lines with at least this fraction of shared
 /// characters are paired into a `Replace` row instead of being shown as a
 /// separate delete + insert. 0.5 means "at least half of the characters are
-/// shared between the two lines" — the same default `git diff` effectively uses.
+/// shared between the two lines".
 pub const DEFAULT_SIMILARITY: f64 = 0.5;
 
 impl Op {
@@ -163,27 +164,26 @@ pub fn pair_replacements(ops: Vec<Op>, threshold: f64) -> Vec<Op> {
 /// `(a_segs, b_segs)`. Returns `None` when the lines are below `threshold`
 /// similar — caller should show them as a delete + insert rather than a Replace.
 ///
-/// Word-level diffing delegates to [`similar::TextDiff::from_words`] (Myers),
-/// and the similarity check uses [`similar::diff_ratio`] so the threshold's
-/// semantics match `similar`'s own definition. The output `Vec<Seg>` is
-/// tate's own type — `similar` produces Equal/Delete/Insert ops; we collapse
-/// adjacent same-tag runs into a single `Seg` with its `changed` flag.
+/// Tokenization splits on alphanumeric runs, so `Section A.1 ... 17` and
+/// `Section A.1 ... 18` produce segments where only `17` / `18` are flagged
+/// `changed = true`. Unchanged tokens scattered across the line stay
+/// un-highlighted.
 pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Vec<Seg>)> {
-    let diff = similar::TextDiff::from_words(a, b);
-    // Sørensen–Dice similarity over characters: shared chars on both sides over
-    // total chars. Matches the original shtuka heuristic so callers' thresholds
-    // keep the same meaning.
+    let ta = tokenize(a);
+    let tb = tokenize(b);
+    let ops = lcs_diff(&ta, &tb);
+
     let mut equal_chars = 0usize;
-    for change in diff.iter_all_changes() {
-        if let similar::ChangeTag::Equal = change.tag() {
-            equal_chars += change.value().chars().count();
+    for op in &ops {
+        if op.typ == OpType::Equal {
+            equal_chars += op.a_val.chars().count();
         }
     }
-    let denom = (a.chars().count() + b.chars().count()).max(1) as f64;
-    let similarity = (2 * equal_chars) as f64 / denom;
+    let similarity = char_similarity(equal_chars, a.chars().count(), b.chars().count());
     if similarity < threshold {
         return None;
     }
+
     let mut a_segs: Vec<Seg> = Vec::new();
     let mut b_segs: Vec<Seg> = Vec::new();
     let push = |segs: &mut Vec<Seg>, text: &str, changed: bool| {
@@ -198,14 +198,15 @@ pub fn inline_segments(a: &str, b: &str, threshold: f64) -> Option<(Vec<Seg>, Ve
         }
         segs.push(Seg { text: text.to_string(), changed });
     };
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Equal => {
-                push(&mut a_segs, change.value(), false);
-                push(&mut b_segs, change.value(), false);
+    for op in &ops {
+        match op.typ {
+            OpType::Equal => {
+                push(&mut a_segs, &op.a_val, false);
+                push(&mut b_segs, &op.b_val, false);
             }
-            similar::ChangeTag::Delete => push(&mut a_segs, change.value(), true),
-            similar::ChangeTag::Insert => push(&mut b_segs, change.value(), true),
+            OpType::Delete => push(&mut a_segs, &op.a_val, true),
+            OpType::Insert => push(&mut b_segs, &op.b_val, true),
+            OpType::Replace => {}
         }
     }
     Some((a_segs, b_segs))
@@ -277,7 +278,6 @@ mod tests {
             Op::insert(1, "new"),
         ];
         let out = pair_replacements(ops, DEFAULT_SIMILARITY);
-        // "gone" vs "new" below threshold → Delete + Insert; "also gone" leftover → Delete.
         assert!(out.iter().any(|o| o.typ == OpType::Delete));
         assert!(out.iter().any(|o| o.typ == OpType::Insert));
         assert!(out.iter().all(|o| o.typ != OpType::Replace));

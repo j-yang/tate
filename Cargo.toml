@@ -3,13 +3,14 @@ name = "tate"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Structured diff primitives: grid alignment, tree diff, and inline replacement pairing"
+description = "Structured diff primitives: grid alignment, XML tree diff, and inline replacement pairing for Rust"
 repository = "https://github.com/j-yang/tate"
+keywords = ["diff", "compare", "alignment", "lcs", "structured"]
+categories = ["text-processing", "development-tools"]
 
 [dependencies]
 roxmltree = "0.20"
 serde = { version = "1", features = ["derive"] }
-similar = { version = "3", default-features = false, features = ["text"] }
 
 [dev-dependencies]
 serde_json = "1"
