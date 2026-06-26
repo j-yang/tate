@@ -166,34 +166,80 @@ If no usable header on either side: fall back to positional 1:1 column slots.
 - LCS Equal → rows matched (may still have cell-level differences in non-common columns).
 - LCS Delete + Insert → collected into pending_del / pending_ins buffers.
 
-**Step 5: Repair gap (greedy similarity pairing)**
+**Step 5: Iterative refinement (coordinate descent)**
 
-For each pending delete/insert block:
-- For each deleted row, find the best-matching unused inserted row by cell similarity.
-- If best similarity ≥ `row_similarity_threshold` (default 0.5): pair as Modified.
-- Leftover deletes: marked as Removed. Leftover inserts: marked as Added.
+After the initial header-based column alignment and LCS row alignment, tate
+alternates:
 
-Cell similarity = fraction of common-column cells that are equal.
+1. **Re-align columns by data**: Using the row-matched pairs, compute a
+   per-column similarity matrix (fraction of matched rows where A's column i
+   equals B's column j). Greedily match highest-similarity column pairs
+   (threshold 0.5), creating matched slots. Remaining columns become one-sided.
+2. **Re-align rows**: With the improved column slots, re-run LCS on row
+   signatures. This may match rows that were previously unmatched (because
+   the column alignment improved the signatures).
+3. **Convergence check**: If column slots and row pairs both stabilise, stop.
+   Maximum `refinement_iters` (default 2).
+
+Each iteration can only improve or maintain alignment quality (monotone
+non-increasing cost). The algorithm converges in finite steps to a local
+optimum. This is **coordinate descent** applied to the coupled row-column
+optimization problem.
+
+The initial column alignment uses header text only. The refinement uses
+**all matched row data** — catching column correspondences that headers
+alone miss (renamed headers, missing headers, data-driven columns).
 
 **Step 6: Render**
 
 For each row pair, walk the column slots and produce CellChange per cell:
-- Both sides present, cells differ → Modified
+- Both sides present, cells differ → Modified (with word-level inline segments)
 - Both sides present, cells equal → Equal
 - Only A → Removed
 - Only B → Added
 
-If a row budget (`lcs_row_budget`, default 4000) is exceeded, skip LCS and align rows positionally.
+Modified cells carry `old_segs` / `new_segs` from
+[`inline_segments`](#module-2-inline--word-level-highlighting), enabling
+word-level highlighting within individual cells.
+
+If a row budget (`lcs_row_budget`, default 4000) is exceeded, LCS is
+skipped and rows are aligned positionally; iterative refinement is also
+disabled.
 
 ### Theoretical properties
 
-- **Row alignment is optimal** given fixed column alignment: LCS on signatures produces the minimum-edit row script.
-- **Column alignment is greedy**: header LCS is not globally optimal for column matching.
-- **No approximation guarantee**: the sequential approach (column → row) has no provable bound on how close the result is to an optimal joint alignment.
+- **Row alignment is optimal** given fixed column alignment: LCS on signatures produces the minimum-edit row script for the aligned columns.
+- **Column alignment via header LCS is greedy**: not globally optimal for column matching.
+- **Iterative refinement converges**: coordinate descent on a finite space, monotone cost decrease, reaches a local optimum in ≤ `refinement_iters` passes.
+- **The joint problem is NP-hard** (see formalization below), so no polynomial-time exact algorithm exists unless P=NP. The iterative refinement is a principled heuristic with a clear theoretical position.
 
 ---
 
-### Gap 1: Column reordering is reported as delete+add
+### Formalization: Table Edit Distance
+
+**Definition.** Given tables T₁=(R₁,C₁,f₁) and T₂=(R₂,C₂,f₂), the *table edit distance* τ(T₁,T₂) is the minimum cost of a sequence of operations transforming T₁ into T₂, with operations:
+
+| Operation | Cost | Effect |
+|-----------|------|--------|
+| insert_row | α | Add a row |
+| delete_row | α | Remove a row |
+| insert_col | β | Add a column |
+| delete_col | β | Remove a column |
+| modify_cell | γ | Change a cell value |
+
+**Metric axioms.** τ satisfies non-negativity, identity, symmetry, and the triangle inequality (standard concatenation argument).
+
+**1D compatibility.** When tables have 1 column, τ reduces to Levenshtein distance.
+
+**NP-hardness.** The basic (order-preserving) version is NP-hard via reduction from Maximum Biclique:
+
+- Construct A = adjacency matrix of bipartite graph G=(U,V,E), B = k×k all-ones matrix.
+- Set α=β=M (M > |U|·|V|), γ=1.
+- Large M forces matching exactly k rows and k columns.
+- Cell cost = zeros in the matched k×k submatrix of A.
+- τ(A,B) ≤ M·(|U|-k) + M·(|V|-k) ⟺ G has a k×k biclique.
+
+**FPT result.** When the column count is small (m₁,m₂ ≤ 20), the problem is fixed-parameter tractable: enumerate all O(2^(m₁+m₂)) column alignments, solve each with a 1D row DP, take the minimum. Time: O(2^(m₁+m₂) · n₁·n₂).
 
 **The problem:** LCS finds the longest common *subsequence* of header cells. If columns are reordered (same set, different order), LCS reports some as deleted and re-added.
 

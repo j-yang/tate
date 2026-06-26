@@ -16,13 +16,19 @@
 //! 4. For each unpaired delete/insert pair left over, check row similarity and
 //!    promote to `modified` when above threshold (the grid-level analogue of
 //!    [`crate::inline::pair_replacements`]).
-//! 5. For each row slot, render cells from each side through the column slots
-//!    and tag `equal | modified | added | removed` per cell.
+//! 5. **Iterative refinement:** re-align columns using the row-matched data
+//!    (not just headers), then re-align rows with the improved column slots.
+//!    Alternate until the alignment stabilises. This is coordinate descent:
+//!    each step is exact (LCS), and the total cost monotonically decreases.
+//! 6. For each row slot, render cells from each side through the column slots
+//!    and tag `equal | modified | added | removed` per cell. Modified cells
+//!    carry word-level inline segments via [`crate::inline::inline_segments`].
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 use crate::inline::OpType;
+use crate::inline::{inline_segments, Seg, DEFAULT_SIMILARITY};
 use crate::lcs::lcs_diff;
 
 /// Status of one cell, row, or column in the aligned grid.
@@ -37,7 +43,9 @@ pub enum Status {
 }
 
 /// One diffed cell: status plus the old and new text (either may be empty when
-/// the cell only exists on one side).
+/// the cell only exists on one side). For `Modified` cells, `old_segs` /
+/// `new_segs` carry word-level inline segments for highlighting only the
+/// changed words within the cell.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct CellChange {
@@ -46,6 +54,10 @@ pub struct CellChange {
     pub old: String,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub new: String,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub old_segs: Vec<Seg>,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub new_segs: Vec<Seg>,
 }
 
 /// One aligned column slot: its display name and its status across the two
@@ -114,6 +126,10 @@ pub struct GridOptions {
     /// When true, `GridColumn.name` uses the detected header text (e.g.
     /// "Variable Name"); when false, uses Excel-style letters (e.g. "A").
     pub use_header_names: bool,
+    /// Maximum iterations of alternating column↔row refinement (coordinate
+    /// descent). Set to 0 to disable (single-pass header→row pipeline only).
+    /// Default: 2 (one refinement pass after the initial alignment).
+    pub refinement_iters: usize,
 }
 
 impl Default for GridOptions {
@@ -123,6 +139,7 @@ impl Default for GridOptions {
             header_fill_ratio: 0.8,
             row_similarity_threshold: 0.5,
             use_header_names: true,
+            refinement_iters: 2,
         }
     }
 }
@@ -143,8 +160,38 @@ pub fn grid_diff(
     let header_a = detect_header_row(rows_a, width_a, opts.header_fill_ratio);
     let header_b = detect_header_row(rows_b, width_b, opts.header_fill_ratio);
 
-    let slots = align_columns(rows_a, rows_b, width_a, width_b, header_a, header_b);
+    // --- Initial column alignment via header LCS ---
+    let mut slots = align_columns_by_header(rows_a, rows_b, width_a, width_b, header_a, header_b);
 
+    // --- Initial row alignment ---
+    let mut row_pairs = if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
+        align_rows_by_position(rows_a, rows_b)
+    } else {
+        align_rows_by_lcs(rows_a, rows_b, &slots, opts)
+    };
+
+    // --- Iterative refinement: coordinate descent on (columns, rows) ---
+    for _ in 0..opts.refinement_iters {
+        if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
+            break;
+        }
+
+        // Re-align columns using the row-matched data (not just headers).
+        let new_slots = align_columns_by_data(rows_a, rows_b, &row_pairs, &slots, width_a, width_b);
+        if new_slots == slots {
+            break; // converged
+        }
+        slots = new_slots;
+
+        // Re-align rows with the improved column slots.
+        let new_pairs = align_rows_by_lcs(rows_a, rows_b, &slots, opts);
+        if new_pairs == row_pairs {
+            break; // converged
+        }
+        row_pairs = new_pairs;
+    }
+
+    // --- Render columns ---
     let head_a: &[String] = if header_a > 0 { &rows_a[header_a - 1] } else { &[] };
     let head_b: &[String] = if header_b > 0 { &rows_b[header_b - 1] } else { &[] };
 
@@ -158,12 +205,15 @@ pub fn grid_diff(
             (true, false) => { gd.removed_cols += 1; Status::Removed }
             _ => Status::Equal,
         };
-        let name = column_display_name(k, slot, head_a, head_b);
+        let name = if opts.use_header_names {
+            column_display_name(k, slot, head_a, head_b)
+        } else {
+            col_letter(k)
+        };
         gd.columns.push(GridColumn { name, status });
     }
 
-    let row_pairs = align_rows(rows_a, rows_b, &slots, opts, &mut gd);
-
+    // --- Render rows ---
     for rp in &row_pairs {
         let mut gr = build_grid_row(*rp, rows_a, rows_b, &slots);
         if (gr.row_a != 0 && gr.row_a == header_a) || (gr.row_b != 0 && gr.row_b == header_b) {
@@ -176,6 +226,13 @@ pub fn grid_diff(
             _ => {}
         }
         gd.rows.push(gr);
+    }
+
+    if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
+        gd.notes.push(format!(
+            "row count exceeds budget ({}); rows matched by position instead of LCS alignment",
+            opts.lcs_row_budget
+        ));
     }
 
     gd
@@ -236,17 +293,108 @@ fn column_display_name(k: usize, slot: &ColSlot, head_a: &[String], head_b: &[St
 
 /// One column slot in the aligned grid. `a`/`b` are 0-based source column
 /// indices, or -1 when the column exists only on the other side.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct ColSlot {
     a: isize,
     b: isize,
 }
 
-/// align_columns matches A's columns to B's by LCS over the header-row cells,
-/// so an inserted or removed column is detected instead of shifting every row.
-/// When no usable header is found (or headers are identical in width), it falls
-/// back to positional 1:1 slots.
-fn align_columns(
+/// Re-align columns using row-matched data instead of headers. For each pair
+/// of matched rows, compute a per-column similarity score (fraction of matched
+/// rows where cells are equal), then greedily match columns by highest
+/// similarity. This catches column correspondences that header-only matching
+/// misses (renamed headers, missing headers, data-driven columns).
+fn align_columns_by_data(
+    rows_a: &[Vec<String>],
+    rows_b: &[Vec<String>],
+    row_pairs: &[RowPair],
+    prev_slots: &[ColSlot],
+    width_a: usize,
+    width_b: usize,
+) -> Vec<ColSlot> {
+    let matched: Vec<(usize, usize)> = row_pairs
+        .iter()
+        .filter(|p| p.a >= 0 && p.b >= 0)
+        .map(|p| (p.a as usize, p.b as usize))
+        .collect();
+
+    if matched.is_empty() {
+        return prev_slots.to_vec();
+    }
+
+    // Compute per-column similarity matrix: sim[i][j] = fraction of matched
+    // rows where A's column i equals B's column j.
+    let col_sim = |ai: usize, bi: usize| -> f64 {
+        let mut same = 0;
+        for &(ra, rb) in &matched {
+            let va = rows_a.get(ra).and_then(|r| r.get(ai)).map(|s| s.as_str()).unwrap_or("");
+            let vb = rows_b.get(rb).and_then(|r| r.get(bi)).map(|s| s.as_str()).unwrap_or("");
+            if va == vb {
+                same += 1;
+            }
+        }
+        same as f64 / matched.len() as f64
+    };
+
+    // Greedy assignment: repeatedly pick the highest-similarity (a_col, b_col)
+    // pair, mark both as used, and create a matched slot. Remaining columns
+    // become one-sided slots.
+    let mut used_a = vec![false; width_a];
+    let mut used_b = vec![false; width_b];
+    let mut slots: Vec<ColSlot> = Vec::new();
+
+    loop {
+        let mut best_sim = 0.0f64;
+        let mut best_ai: isize = -1;
+        let mut best_bi: isize = -1;
+        for (ai, &ua) in used_a.iter().enumerate().take(width_a) {
+            if ua {
+                continue;
+            }
+            for (bi, &ub) in used_b.iter().enumerate().take(width_b) {
+                if ub {
+                    continue;
+                }
+                let s = col_sim(ai, bi);
+                if s > best_sim {
+                    best_sim = s;
+                    best_ai = ai as isize;
+                    best_bi = bi as isize;
+                }
+            }
+        }
+        if best_ai < 0 || best_sim < 0.5 {
+            break;
+        }
+        used_a[best_ai as usize] = true;
+        used_b[best_bi as usize] = true;
+        slots.push(ColSlot { a: best_ai, b: best_bi });
+    }
+
+    // Remaining unmatched columns → one-sided slots.
+    for (ai, &used) in used_a.iter().enumerate().take(width_a) {
+        if !used {
+            slots.push(ColSlot { a: ai as isize, b: -1 });
+        }
+    }
+    for (bi, &used) in used_b.iter().enumerate().take(width_b) {
+        if !used {
+            slots.push(ColSlot { a: -1, b: bi as isize });
+        }
+    }
+
+    // Sort slots: matched first (in A order), then A-only, then B-only.
+    slots.sort_by_key(|s| {
+        let order = if s.a >= 0 && s.b >= 0 { 0 } else if s.a >= 0 { 1 } else { 2 };
+        (order, s.a.max(0), s.b.max(0))
+    });
+
+    slots
+}
+
+/// align_columns_by_header matches A's columns to B's by LCS over the header-row
+/// cells. When no usable header is found, falls back to positional 1:1 slots.
+fn align_columns_by_header(
     rows_a: &[Vec<String>],
     rows_b: &[Vec<String>],
     width_a: usize,
@@ -293,24 +441,20 @@ fn align_columns(
     slots
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 struct RowPair {
     a: isize,
     b: isize,
 }
 
+#[allow(dead_code)]
 fn align_rows(
     rows_a: &[Vec<String>],
     rows_b: &[Vec<String>],
     slots: &[ColSlot],
     opts: &GridOptions,
-    gd: &mut GridDiff,
 ) -> Vec<RowPair> {
     if rows_a.len() > opts.lcs_row_budget || rows_b.len() > opts.lcs_row_budget {
-        gd.notes.push(format!(
-            "row count exceeds budget ({}); rows matched by position instead of LCS alignment",
-            opts.lcs_row_budget
-        ));
         return align_rows_by_position(rows_a, rows_b);
     }
     align_rows_by_lcs(rows_a, rows_b, slots, opts)
@@ -466,24 +610,37 @@ fn build_grid_row(rp: RowPair, rows_a: &[Vec<String>], rows_b: &[Vec<String>], s
         }
     };
 
+    let empty_segs = || (Vec::new(), Vec::new());
+
     let mut modified = false;
     for slot in slots {
         let va = get(ra, slot.a);
         let vb = get(rb, slot.b);
         let cc = if slot.b < 0 {
-            CellChange { status: Status::Removed, old: va, new: String::new() }
+            let (s1, s2) = empty_segs();
+            CellChange { status: Status::Removed, old: va, new: String::new(), old_segs: s1, new_segs: s2 }
         } else if slot.a < 0 {
-            CellChange { status: Status::Added, old: String::new(), new: vb }
+            let (s1, s2) = empty_segs();
+            CellChange { status: Status::Added, old: String::new(), new: vb, old_segs: s1, new_segs: s2 }
         } else {
             match row_status {
-                Status::Added => CellChange { status: Status::Added, old: String::new(), new: vb },
-                Status::Removed => CellChange { status: Status::Removed, old: va, new: String::new() },
+                Status::Added => {
+                    let (s1, s2) = empty_segs();
+                    CellChange { status: Status::Added, old: String::new(), new: vb, old_segs: s1, new_segs: s2 }
+                }
+                Status::Removed => {
+                    let (s1, s2) = empty_segs();
+                    CellChange { status: Status::Removed, old: va, new: String::new(), old_segs: s1, new_segs: s2 }
+                }
                 _ => {
                     if va != vb {
                         modified = true;
-                        CellChange { status: Status::Modified, old: va, new: vb }
+                        let (old_segs, new_segs) = inline_segments(&va, &vb, DEFAULT_SIMILARITY)
+                            .unwrap_or_else(empty_segs);
+                        CellChange { status: Status::Modified, old: va, new: vb, old_segs, new_segs }
                     } else {
-                        CellChange { status: Status::Equal, old: String::new(), new: vb }
+                        let (s1, s2) = empty_segs();
+                        CellChange { status: Status::Equal, old: String::new(), new: vb, old_segs: s1, new_segs: s2 }
                     }
                 }
             }
