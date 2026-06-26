@@ -77,10 +77,15 @@ pub struct GridRow {
 pub struct GridDiff {
     pub columns: Vec<GridColumn>,
     pub rows: Vec<GridRow>,
+    #[cfg_attr(feature = "serde", serde(rename = "addedRows"))]
     pub added_rows: usize,
+    #[cfg_attr(feature = "serde", serde(rename = "removedRows"))]
     pub removed_rows: usize,
+    #[cfg_attr(feature = "serde", serde(rename = "modifiedRows"))]
     pub modified_rows: usize,
+    #[cfg_attr(feature = "serde", serde(rename = "addedCols"))]
     pub added_cols: usize,
+    #[cfg_attr(feature = "serde", serde(rename = "removedCols"))]
     pub removed_cols: usize,
     /// Operational notes surfaced to the UI (e.g. "row budget exceeded,
     /// positional alignment used").

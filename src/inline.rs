@@ -41,6 +41,7 @@ pub enum OpType {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Op {
+    #[cfg_attr(feature = "serde", serde(rename = "type"))]
     pub typ: OpType,
     pub a: usize,
     pub b: usize,
