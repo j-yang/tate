@@ -13,9 +13,10 @@
 //! - [`grid`] — aligns two 2D grids of strings (rows × columns) and emits one
 //!   aligned grid with per-cell status. Works against arbitrary
 //!   `&[Vec<String>]` (Excel, CSV, HTML tables, SQL result sets, …).
-//! - [`tree`] — structural diff of two XML documents keyed by identity
-//!   attributes, emitting `added | removed | modified` changes per node with
-//!   no schema-specific semantics.
+//! - [`tree`] — structural diff of two [`tree::TreeNode`]s (a format-agnostic
+//!   intermediate representation). Callers convert from their format (XML, JSON,
+//!   YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing
+//!   dependencies.
 //!
 //! Typical pipeline for text-file diff:
 //! ```

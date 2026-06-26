@@ -1,26 +1,105 @@
-//! Structural tree diff: walk two tree documents in parallel and emit
-//! `added | removed | modified` changes per node, keyed by identity attributes.
-//! Schema-agnostic — no application-specific concepts (CDISC, BPMN, SVG, …)
-//! leak into the output; callers layer those on top of [`TreeChange`].
+//! Structural tree diff: walk two trees in parallel and emit
+//! `added | removed | modified` changes per node, keyed by identity.
 //!
-//! Algorithm:
-//! 1. Parse both documents via `roxmltree`.
-//! 2. Walk them in parallel, matching children by identity key — a stable
-//!    identity drawn from the first present attribute in
-//!    [`TreeOptions::identity_attrs`], falling back to the tag name for
-//!    keyless nodes (positional pairing).
-//! 3. For matched nodes: compare tag names, attributes, and text; recurse
-//!    into children.
-//! 4. For unmatched nodes: emit `Added` / `Removed`, recursively surfacing
-//!    their identity-bearing descendants.
-//! 5. A change in a keyless descendant bubbles up to the nearest identity-bearing
-//!    ancestor (which is what appears in the change list).
-
-use roxmltree::Document;
-use std::collections::BTreeMap;
+//! Operates on a format-agnostic intermediate representation [`TreeNode`].
+//! Callers convert their format (XML, JSON, YAML, …) into `TreeNode` before
+//! calling [`tree_diff`]. tate has zero format-parsing dependencies.
+//!
+//! ## TreeNode model
+//!
+//! Each node has:
+//! - `kind`: the element type (XML tag name, JSON object key, `"[array]"`)
+//! - `identity`: an optional identity value used for sibling matching — must
+//!   be set by the caller during conversion (e.g. XML `OID` attr, JSON object key)
+//! - `label`: a human-readable name for the node
+//! - `attributes`: key-value pairs for scalar properties (XML attributes, JSON
+//!   leaf-valued object properties)
+//! - `text`: direct text content (XML text, JSON scalar value)
+//! - `children`: nested nodes (XML child elements, JSON object-valued properties,
+//!   array items)
+//!
+//! Nodes with `identity` set are "locatable" — they appear in the change list
+//! on their own. Nodes without identity are matched positionally among siblings
+//! of the same kind; changes in keyless descendants bubble up to the nearest
+//! identity-bearing ancestor.
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
+
+/// A format-agnostic tree node. Convert from your format (XML, JSON, …) into
+/// this type, then call [`tree_diff`].
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct TreeNode {
+    /// Element type (XML tag name, JSON object key, `"[array]"` for array items).
+    pub kind: String,
+    /// Identity value used for sibling matching. `None` means positional
+    /// matching. Set this during conversion from format-specific identity
+    /// attributes (XML `OID`/`id`/`Name`) or structural identity (JSON object key).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub identity: Option<String>,
+    /// Human-readable label for the node. Set during conversion; typically the
+    /// `name` attribute (XML) or the object key (JSON).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub label: String,
+    /// Scalar key-value pairs (XML attributes, JSON leaf properties).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub attributes: Vec<(String, String)>,
+    /// Direct text content (XML text, JSON scalar value as string).
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub text: String,
+    /// Nested child nodes.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub children: Vec<TreeNode>,
+}
+
+impl TreeNode {
+    /// Convenience constructor for a node with kind and identity.
+    pub fn new(kind: impl Into<String>) -> Self {
+        TreeNode {
+            kind: kind.into(),
+            ..Default::default()
+        }
+    }
+
+    /// Set the identity value.
+    pub fn with_identity(mut self, id: impl Into<String>) -> Self {
+        self.identity = Some(id.into());
+        self
+    }
+
+    /// Set the label.
+    pub fn with_label(mut self, label: impl Into<String>) -> Self {
+        self.label = label.into();
+        self
+    }
+
+    /// Add an attribute.
+    pub fn with_attr(mut self, key: impl Into<String>, val: impl Into<String>) -> Self {
+        self.attributes.push((key.into(), val.into()));
+        self
+    }
+
+    /// Set the text content.
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self
+    }
+
+    /// Add a child node.
+    pub fn with_child(mut self, child: TreeNode) -> Self {
+        self.children.push(child);
+        self
+    }
+
+    /// Look up an attribute by name.
+    pub fn attr(&self, name: &str) -> Option<&str> {
+        self.attributes
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
 
 /// Kind of tree change. `Modified` means the node matched on identity but its
 /// attributes, text, or descendants changed.
@@ -45,22 +124,19 @@ pub struct AttrChange {
     pub new: String,
 }
 
-/// One changed node: its kind, identity, and what changed. No schema-specific
+/// One changed node: its kind, identity, and what changed. No format-specific
 /// fields — applications layer domain semantics on top.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeChange {
     pub kind: ChangeKind,
-    /// Local tag name of the element (e.g. "entry", "group", "div").
+    /// Element type (tag name / object key).
     #[cfg_attr(feature = "serde", serde(rename = "elemType"))]
     pub elem_type: String,
-    /// Value of the first identity attribute present on the node, or empty when
-    /// the node carries none. Applications use this to anchor a highlight in
-    /// their own view; tate does not interpret it.
+    /// Identity value, or empty for keyless nodes.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub id: String,
-    /// Human-readable label: typically the value of the `name` attribute when
-    /// present, falling back to `id`. Empty when neither is set.
+    /// Human-readable label.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub label: String,
     /// Attribute changes for a `Modified` node; empty for `Added` / `Removed`.
@@ -68,7 +144,7 @@ pub struct TreeChange {
     pub changed_attrs: Vec<AttrChange>,
 }
 
-/// The result of tree-diffing two documents.
+/// The result of tree-diffing two [`TreeNode`]s.
 #[derive(Debug, Default, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeDiff {
@@ -76,162 +152,130 @@ pub struct TreeDiff {
     pub changes: Vec<TreeChange>,
 }
 
-/// Configuration for [`tree_diff_with`]. Controls which attributes are treated
-/// as identity-bearing when matching nodes and deciding whether a node can
-/// appear in the change list on its own. Defaults to common conventions
-/// (`id`, `name`) that work across a wide range of schemas. Override when your
-/// schema uses domain-specific identity attributes (e.g. `OID`/`Name` for
-/// CDISC ODM, `group`/`artifactId` for Maven POM, `ref`/`id` for SVG).
-#[derive(Debug, Clone)]
-pub struct TreeOptions {
-    /// Identity attributes considered when matching children among siblings and
-    /// deciding whether a node is locatable. The first present attribute in this
-    /// list wins. Defaults to `["id", "name"]`.
-    pub identity_attrs: Vec<String>,
-}
-
-impl Default for TreeOptions {
-    fn default() -> Self {
-        TreeOptions {
-            identity_attrs: vec!["id".to_string(), "name".to_string()],
-        }
-    }
-}
-
-/// Diff two XML strings with default [`TreeOptions`].
-pub fn tree_diff(xml_a: &str, xml_b: &str) -> Result<TreeDiff, String> {
-    tree_diff_with(xml_a, xml_b, &TreeOptions::default())
-}
-
-/// Diff two XML strings with explicit [`TreeOptions`].
-pub fn tree_diff_with(xml_a: &str, xml_b: &str, opts: &TreeOptions) -> Result<TreeDiff, String> {
-    let da = Document::parse(xml_a).map_err(|e| format!("parse A: {e}"))?;
-    let db = Document::parse(xml_b).map_err(|e| format!("parse B: {e}"))?;
+/// Diff two tree nodes and return the structural changes.
+///
+/// The root nodes are compared directly. Interior nodes are matched by
+/// `kind#identity` (or just `kind` when identity is absent → positional).
+/// Changes in keyless descendants bubble up to the nearest identity-bearing
+/// ancestor.
+///
+/// ```
+/// use tate::tree::{TreeNode, tree_diff, ChangeKind};
+///
+/// let a = TreeNode::new("root")
+///     .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "1"));
+/// let b = TreeNode::new("root")
+///     .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "99"));
+///
+/// let diff = tree_diff(&a, &b);
+/// assert_eq!(diff.changes.len(), 1);
+/// assert_eq!(diff.changes[0].kind, ChangeKind::Modified);
+/// assert!(diff.changes[0].changed_attrs.iter().any(|c| c.name == "level"));
+/// ```
+pub fn tree_diff(a: &TreeNode, b: &TreeNode) -> TreeDiff {
     let mut changes = Vec::new();
-    let changed = diff_node(da.root_element(), db.root_element(), &mut changes, opts);
-    // Root is the top of the bubble chain — if it changed but wasn't locatable
-    // (no identity attr), nothing was reported. Surface it so tag renames and
-    // text changes on the root are not silently lost.
+    let changed = diff_node(a, b, &mut changes);
+    // Root fallback: if the whole tree changed but no locatable node was reported,
+    // surface the root so the caller sees something.
     if changed && changes.is_empty() {
-        let b_root = db.root_element();
-        let attr_changes = attr_diffs(da.root_element(), b_root);
-        changes.push(mk_change(ChangeKind::Modified, b_root, attr_changes, opts));
+        changes.push(mk_change(ChangeKind::Modified, b, attr_diffs(a, b)));
     }
-    Ok(TreeDiff { changes })
+    TreeDiff { changes }
 }
 
-/// First present identity attribute on `n`, as `(attr_name, value)`.
-fn first_identity<'a>(n: roxmltree::Node<'a, 'a>, opts: &'a TreeOptions) -> Option<(&'a str, &'a str)> {
-    for attr in &opts.identity_attrs {
-        if let Some(v) = n.attribute(attr.as_str()) {
-            return Some((attr.as_str(), v));
-        }
-    }
-    None
-}
-
-/// A stable key for matching a node among its siblings. Returns `tag#value`
-/// when an identity attribute is present, otherwise just the tag (positional
-/// pairing handles reordering for keyless nodes).
-fn node_key(n: roxmltree::Node, opts: &TreeOptions) -> String {
-    let tag = n.tag_name().name();
-    if let Some((_, v)) = first_identity(n, opts) {
-        format!("{tag}#{v}")
-    } else {
-        tag.to_string()
+/// A stable key for matching a node among its siblings. Returns `kind#identity`
+/// when identity is present, otherwise just `kind` (positional pairing).
+fn node_key(n: &TreeNode) -> String {
+    match &n.identity {
+        Some(id) => format!("{}#{}", n.kind, id),
+        None => n.kind.clone(),
     }
 }
 
-fn local_tag<'a>(n: roxmltree::Node<'a, 'a>) -> &'a str {
-    n.tag_name().name()
+/// Locatable = has an identity. These can appear in the change list on their
+/// own; keyless nodes cannot (their changes bubble up).
+fn is_locatable(n: &TreeNode) -> bool {
+    n.identity.is_some()
 }
 
-/// Build a change record for a node (added/removed/modified), pulling the
-/// identity and label from the configured identity attributes.
-fn mk_change(kind: ChangeKind, n: roxmltree::Node, changed_attrs: Vec<AttrChange>, opts: &TreeOptions) -> TreeChange {
-    let elem_type = local_tag(n).to_string();
-    let (id, label) = match first_identity(n, opts) {
-        Some((_, v)) => {
-            let name = n.attribute("name").unwrap_or("").to_string();
-            let label = if !name.is_empty() { name } else { v.to_string() };
-            (v.to_string(), label)
-        }
-        None => (String::new(), String::new()),
-    };
-    TreeChange { kind, elem_type, id, label, changed_attrs }
-}
-
-/// direct_text = concatenation of this node's immediate text children, whitespace-
-/// normalised.
-fn direct_text(n: roxmltree::Node) -> String {
-    let mut s = String::new();
-    for c in n.children() {
-        if c.is_text() {
-            s.push_str(c.text().unwrap_or(""));
-        }
+/// Build a change record for a node, pulling identity and label from the node.
+fn mk_change(kind: ChangeKind, n: &TreeNode, changed_attrs: Vec<AttrChange>) -> TreeChange {
+    TreeChange {
+        kind,
+        elem_type: n.kind.clone(),
+        id: n.identity.clone().unwrap_or_default(),
+        label: n.label.clone(),
+        changed_attrs,
     }
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// attr_diffs lists attributes that differ as AttrChange records.
-fn attr_diffs(a: roxmltree::Node, b: roxmltree::Node) -> Vec<AttrChange> {
-    let am: BTreeMap<&str, &str> = a.attributes().map(|x| (x.name(), x.value())).collect();
-    let bm: BTreeMap<&str, &str> = b.attributes().map(|x| (x.name(), x.value())).collect();
+/// Compare two nodes' attributes, returning changes.
+fn attr_diffs(a: &TreeNode, b: &TreeNode) -> Vec<AttrChange> {
+    let am: std::collections::BTreeMap<&str, &str> =
+        a.attributes.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let bm: std::collections::BTreeMap<&str, &str> =
+        b.attributes.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
     let mut out = Vec::new();
     for (k, bv) in &bm {
         match am.get(k) {
             Some(av) if av == bv => {}
-            Some(av) => out.push(AttrChange { name: k.to_string(), old: av.to_string(), new: bv.to_string() }),
-            None => out.push(AttrChange { name: k.to_string(), old: String::new(), new: bv.to_string() }),
+            Some(av) => out.push(AttrChange {
+                name: k.to_string(),
+                old: av.to_string(),
+                new: bv.to_string(),
+            }),
+            None => out.push(AttrChange {
+                name: k.to_string(),
+                old: String::new(),
+                new: bv.to_string(),
+            }),
         }
     }
     for (k, av) in &am {
         if !bm.contains_key(k) {
-            out.push(AttrChange { name: k.to_string(), old: av.to_string(), new: String::new() });
+            out.push(AttrChange {
+                name: k.to_string(),
+                old: av.to_string(),
+                new: String::new(),
+            });
         }
     }
     out
 }
 
-/// Locatable = has a configured identity attribute. These can appear in the
-/// change list on their own; keyless nodes cannot (their changes bubble up).
-fn node_is_locatable(n: roxmltree::Node, opts: &TreeOptions) -> bool {
-    first_identity(n, opts).is_some()
-}
-
 /// Returns true if anything in this subtree (this node or a descendant) changed.
 /// A change in a keyless descendant bubbles up to the nearest identity-bearing
 /// ancestor, which is what gets reported.
-fn diff_node(a: roxmltree::Node, b: roxmltree::Node, out: &mut Vec<TreeChange>, opts: &TreeOptions) -> bool {
-    let locatable = node_is_locatable(b, opts);
+fn diff_node(a: &TreeNode, b: &TreeNode, out: &mut Vec<TreeChange>) -> bool {
+    let locatable = is_locatable(b);
     let attr_changes = attr_diffs(a, b);
-    let text_changed = direct_text(a) != direct_text(b);
-    let tag_changed = local_tag(a) != local_tag(b);
+    let text_changed = a.text != b.text;
+    let tag_changed = a.kind != b.kind;
     let mut own_changed = tag_changed || !attr_changes.is_empty() || text_changed;
 
-    let a_children: Vec<roxmltree::Node> = a.children().filter(|c| c.is_element()).collect();
-    let b_children: Vec<roxmltree::Node> = b.children().filter(|c| c.is_element()).collect();
-    let mut a_by_key: BTreeMap<String, Vec<roxmltree::Node>> = BTreeMap::new();
-    for c in &a_children {
-        a_by_key.entry(node_key(*c, opts)).or_default().push(*c);
+    // Match children by key.
+    let mut a_by_key: std::collections::BTreeMap<String, Vec<&TreeNode>> =
+        std::collections::BTreeMap::new();
+    for c in &a.children {
+        a_by_key.entry(node_key(c)).or_default().push(c);
     }
-    let mut a_used: BTreeMap<String, usize> = BTreeMap::new();
+    let mut a_used: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut descendant_changed = false;
 
-    for &bc in &b_children {
-        let key = node_key(bc, opts);
+    for bc in &b.children {
+        let key = node_key(bc);
         let idx = a_used.entry(key.clone()).or_insert(0);
         let matched = a_by_key.get(&key).and_then(|v| v.get(*idx)).copied();
         match matched {
             Some(ac) => {
                 *idx += 1;
-                let child_changed = diff_node(ac, bc, out, opts);
-                if child_changed && !node_is_locatable(bc, opts) {
+                let child_changed = diff_node(ac, bc, out);
+                if child_changed && !is_locatable(bc) {
                     descendant_changed = true;
                 }
             }
             None => {
-                if !emit_subtree(ChangeKind::Added, bc, out, opts) {
+                if !emit_subtree(ChangeKind::Added, bc, out) {
                     descendant_changed = true;
                 }
             }
@@ -240,14 +284,14 @@ fn diff_node(a: roxmltree::Node, b: roxmltree::Node, out: &mut Vec<TreeChange>, 
     for (key, nodes) in &a_by_key {
         let used = a_used.get(key).copied().unwrap_or(0);
         for &ac in nodes.iter().skip(used) {
-            if !emit_subtree(ChangeKind::Removed, ac, out, opts) {
+            if !emit_subtree(ChangeKind::Removed, ac, out) {
                 descendant_changed = true;
             }
         }
     }
 
     if locatable && (own_changed || descendant_changed) {
-        out.push(mk_change(ChangeKind::Modified, b, attr_changes, opts));
+        out.push(mk_change(ChangeKind::Modified, b, attr_changes));
         own_changed = true;
     }
 
@@ -255,17 +299,15 @@ fn diff_node(a: roxmltree::Node, b: roxmltree::Node, out: &mut Vec<TreeChange>, 
 }
 
 /// Emit a change for an added/removed node and its identity-bearing descendants.
-/// Returns true if at least one identity-bearing node was reported (so the
-/// caller knows whether the change is independently locatable, or must bubble
-/// up).
-fn emit_subtree(kind: ChangeKind, n: roxmltree::Node, out: &mut Vec<TreeChange>, opts: &TreeOptions) -> bool {
+/// Returns true if at least one identity-bearing node was reported.
+fn emit_subtree(kind: ChangeKind, n: &TreeNode, out: &mut Vec<TreeChange>) -> bool {
     let mut reported = false;
-    if node_is_locatable(n, opts) {
-        out.push(mk_change(kind, n, Vec::new(), opts));
+    if is_locatable(n) {
+        out.push(mk_change(kind, n, Vec::new()));
         reported = true;
     }
-    for c in n.children().filter(|c| c.is_element()) {
-        if emit_subtree(kind, c, out, opts) {
+    for c in &n.children {
+        if emit_subtree(kind, c, out) {
             reported = true;
         }
     }
@@ -278,90 +320,119 @@ mod tests {
 
     #[test]
     fn modified_node_reports_changed_attrs() {
-        let a = r#"<root><entry id="u1" name="alice" role="user" level="1"/></root>"#;
-        let b = r#"<root><entry id="u1" name="alice" role="user" level="99"/></root>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "1"));
+        let b = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "99"));
+        let d = tree_diff(&a, &b);
         assert_eq!(d.changes.len(), 1);
         assert_eq!(d.changes[0].kind, ChangeKind::Modified);
         assert_eq!(d.changes[0].id, "u1");
-        assert_eq!(d.changes[0].label, "alice");
         assert!(d.changes[0].changed_attrs.iter().any(|c| c.name == "level" && c.old == "1" && c.new == "99"));
     }
 
     #[test]
     fn added_node_is_reported() {
-        let a = r#"<root><entry id="u1"/></root>"#;
-        let b = r#"<root><entry id="u1"/><entry id="u2"/></root>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("root").with_child(TreeNode::new("entry").with_identity("u1"));
+        let b = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("u1"))
+            .with_child(TreeNode::new("entry").with_identity("u2"));
+        let d = tree_diff(&a, &b);
         assert!(d.changes.iter().any(|c| c.kind == ChangeKind::Added && c.id == "u2"));
     }
 
     #[test]
     fn removed_node_is_reported() {
-        let a = r#"<root><entry id="u1"/><entry id="u2"/></root>"#;
-        let b = r#"<root><entry id="u1"/></root>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("u1"))
+            .with_child(TreeNode::new("entry").with_identity("u2"));
+        let b = TreeNode::new("root").with_child(TreeNode::new("entry").with_identity("u1"));
+        let d = tree_diff(&a, &b);
         assert!(d.changes.iter().any(|c| c.kind == ChangeKind::Removed && c.id == "u2"));
     }
 
     #[test]
-    fn identical_docs_no_changes() {
-        let a = r#"<root><entry id="u1" name="alice"/></root>"#;
-        let b = r#"<root><entry id="u1" name="alice"/></root>"#;
-        let d = tree_diff(a, b).unwrap();
+    fn identical_trees_no_changes() {
+        let a = TreeNode::new("root").with_child(TreeNode::new("entry").with_identity("u1").with_label("alice"));
+        let b = a.clone();
+        let d = tree_diff(&a, &b);
         assert!(d.changes.is_empty());
     }
 
     #[test]
     fn keyless_descendant_bubbles_up() {
-        let a = r#"<root><group id="g1" name="G"><option value="A"/></group></root>"#;
-        let b = r#"<root><group id="g1" name="G"><option value="B"/></group></root>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("root")
+            .with_child(
+                TreeNode::new("group").with_identity("g1")
+                    .with_child(TreeNode::new("option").with_attr("value", "A")),
+            );
+        let b = TreeNode::new("root")
+            .with_child(
+                TreeNode::new("group").with_identity("g1")
+                    .with_child(TreeNode::new("option").with_attr("value", "B")),
+            );
+        let d = tree_diff(&a, &b);
         assert!(d.changes.iter().any(|c| c.elem_type == "group" && c.kind == ChangeKind::Modified));
         assert!(!d.changes.iter().any(|c| c.elem_type == "option"), "keyless child should not appear directly");
     }
 
     #[test]
     fn reordered_nodes_match_by_key() {
-        let a = r#"<root><entry id="a"/><entry id="b"/></root>"#;
-        let b = r#"<root><entry id="b"/><entry id="a"/></root>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("a"))
+            .with_child(TreeNode::new("entry").with_identity("b"));
+        let b = TreeNode::new("root")
+            .with_child(TreeNode::new("entry").with_identity("b"))
+            .with_child(TreeNode::new("entry").with_identity("a"));
+        let d = tree_diff(&a, &b);
         assert!(d.changes.is_empty(), "reordering by key should not report changes");
     }
 
     #[test]
-    fn parse_error_returned() {
-        let result = tree_diff("<not xml", "<root/>");
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn root_tag_rename_is_detected() {
-        let a = r#"<foo/>"#;
-        let b = r#"<bar/>"#;
-        let d = tree_diff(a, b).unwrap();
+        let a = TreeNode::new("foo");
+        let b = TreeNode::new("bar");
+        let d = tree_diff(&a, &b);
         assert!(!d.changes.is_empty(), "root tag rename must be detected");
     }
 
     #[test]
-    fn custom_identity_attrs() {
-        let a = r#"<root><node ref="x"/><node ref="y"/></root>"#;
-        let b = r#"<root><node ref="y"/><node ref="x"/></root>"#;
-
-        // With ref as identity: reordering is matched by key, no changes.
-        let opts = TreeOptions { identity_attrs: vec!["ref".to_string()] };
-        let d_custom = tree_diff_with(a, b, &opts).unwrap();
-        assert!(d_custom.changes.is_empty());
+    fn json_like_object_diff() {
+        // Simulates a JSON object: kind=key, identity=key, attributes=scalar properties,
+        // children=nested objects.
+        let a = TreeNode::new("config")
+            .with_child(
+                TreeNode::new("server").with_identity("server")
+                    .with_attr("port", "8080")
+                    .with_attr("host", "localhost"),
+            );
+        let b = TreeNode::new("config")
+            .with_child(
+                TreeNode::new("server").with_identity("server")
+                    .with_attr("port", "9090")
+                    .with_attr("host", "localhost"),
+            );
+        let d = tree_diff(&a, &b);
+        assert_eq!(d.changes.len(), 1);
+        assert_eq!(d.changes[0].id, "server");
+        assert!(d.changes[0].changed_attrs.iter().any(|c| c.name == "port" && c.old == "8080" && c.new == "9090"));
     }
 
     #[test]
-    fn custom_identity_attrs_detects_actual_change() {
-        let a = r#"<doc><node ref="x" value="1"/><node ref="y" value="2"/></doc>"#;
-        let b = r#"<doc><node ref="y" value="2"/><node ref="x" value="9"/></doc>"#;
-        let opts = TreeOptions { identity_attrs: vec!["ref".to_string()] };
-        let d = tree_diff_with(a, b, &opts).unwrap();
-        assert_eq!(d.changes.len(), 1);
-        assert_eq!(d.changes[0].id, "x");
-        assert!(d.changes[0].changed_attrs.iter().any(|c| c.name == "value" && c.old == "1" && c.new == "9"));
+    fn json_like_array_diff() {
+        // Array items have no identity → positional matching.
+        let a = TreeNode::new("list")
+            .with_child(TreeNode::new("[0]").with_text("a"))
+            .with_child(TreeNode::new("[1]").with_text("b"))
+            .with_child(TreeNode::new("[2]").with_text("c"));
+        let b = TreeNode::new("list")
+            .with_child(TreeNode::new("[0]").with_text("a"))
+            .with_child(TreeNode::new("[1]").with_text("b"))
+            .with_child(TreeNode::new("[2]").with_text("x"))
+            .with_child(TreeNode::new("[3]").with_text("d"));
+        let d = tree_diff(&a, &b);
+        // Array items are keyless → changes bubble up to "list" (which is also keyless)
+        // → bubble to root → root fallback fires.
+        assert!(!d.changes.is_empty(), "array changes should surface via root fallback");
     }
 }
