@@ -68,6 +68,8 @@ pub struct Seg {
 pub const DEFAULT_SIMILARITY: f64 = 0.5;
 
 impl Op {
+    /// Construct an `Equal` op: line `a` in the old sequence matches line `b`
+    /// in the new.
     pub fn equal(a: usize, b: usize, old: &str, new: &str) -> Self {
         Op {
             typ: OpType::Equal,
@@ -80,6 +82,7 @@ impl Op {
         }
     }
 
+    /// Construct an `Insert` op: line `b` was added to the new sequence.
     pub fn insert(b: usize, new: &str) -> Self {
         Op {
             typ: OpType::Insert,
@@ -92,6 +95,7 @@ impl Op {
         }
     }
 
+    /// Construct a `Delete` op: line `a` was removed from the old sequence.
     pub fn delete(a: usize, old: &str) -> Self {
         Op {
             typ: OpType::Delete,
@@ -104,6 +108,8 @@ impl Op {
         }
     }
 
+    /// Construct a `Replace` op from a paired delete+insert with precomputed
+    /// word-level inline segments.
     pub fn replace(
         a: usize,
         b: usize,

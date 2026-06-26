@@ -14,9 +14,7 @@ Tate provides four facilities for diffing structured data, all with zero externa
 
 - **`grid`** — Aligns two 2D grids of strings (rows × columns) and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs.
 
-- **`tree`** — Structural diff of two XML documents keyed by identity attributes, emitting `added` / `removed` / `modified` changes per node. Schema-agnostic: callers configure which attributes are identity-bearing via `TreeOptions`.
-
-The line-diff itself (Myers, patience, LCS, Hirschberg, …) is the caller's responsibility — tate consumes their edit scripts via `inline::pair_replacements` and runs its own small word-level LCS diff via `inline::inline_segments` for single-line highlights. No external diff engine is required.
+- **`tree`** — Structural diff of two `TreeNode`s (a format-agnostic intermediate representation). Callers convert from their format (XML, JSON, YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing dependencies.
 
 ## Usage
 
@@ -47,53 +45,40 @@ use tate::grid::{grid_diff, GridOptions};
 let a = vec![
     vec!["name".into(), "amount".into()],
     vec!["Alice".into(), "100".into()],
-    vec!["Bob".into(), "200".into()],
 ];
 let b = vec![
     vec!["name".into(), "amount".into()],
-    vec!["Alice".into(), "100".into()],
-    vec!["Bob".into(), "250".into()],
+    vec!["Alice".into(), "250".into()],
 ];
 
 let diff = grid_diff(&a, &b, &GridOptions::default());
 assert_eq!(diff.modified_rows, 1);
 ```
 
-### XML tree diff
+### Tree diff (format-agnostic)
 
 ```rust
-use tate::tree::tree_diff;
+use tate::tree::{TreeNode, tree_diff, ChangeKind};
 
-let a = r#"<root><entry id="u1" name="alice" level="1"/></root>"#;
-let b = r#"<root><entry id="u1" name="alice" level="99"/></root>"#;
+let a = TreeNode::new("root")
+    .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "1"));
+let b = TreeNode::new("root")
+    .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "99"));
 
-let diff = tree_diff(a, b).unwrap();
+let diff = tree_diff(&a, &b);
 assert_eq!(diff.changes.len(), 1);
-assert_eq!(diff.changes[0].kind, tate::tree::ChangeKind::Modified);
-```
-
-### Custom identity attributes
-
-```rust
-use tate::tree::{tree_diff_with, TreeOptions};
-
-let opts = TreeOptions { identity_attrs: vec!["ref".into()] };
-let a = r#"<doc><node ref="x" value="1"/></doc>"#;
-let b = r#"<doc><node ref="x" value="9"/></doc>"#;
-
-let diff = tree_diff_with(a, b, &opts).unwrap();
-assert_eq!(diff.changes.len(), 1);
+assert_eq!(diff.changes[0].kind, ChangeKind::Modified);
 ```
 
 ## Design
 
-- **Self-contained.** Zero external diff-engine dependencies. The only crate dependencies are `roxmltree` (XML parsing for `tree`) and `serde` (optional, behind the default `serde` feature).
+- **Self-contained.** Zero external dependencies beyond `serde` (optional, behind the default `serde` feature). No `similar`, no `roxmltree`, no `imara-diff`.
 
-- **Format-agnostic.** `grid_diff` accepts `&[Vec<String>]` — it doesn't know whether rows came from Excel, CSV, or a database query. `tree_diff` outputs generic `TreeChange` with no schema-specific fields.
+- **Format-agnostic.** `grid_diff` accepts `&[Vec<String>]`. `tree_diff` operates on `TreeNode` — callers convert from XML, JSON, YAML, or any tree format. tate has no file-format knowledge.
 
-- **Configurable.** Every heuristic (header detection ratio, row similarity threshold, LCS row budget, identity attributes) is exposed via `GridOptions` / `TreeOptions` with sensible defaults.
+- **Configurable.** Every heuristic (header detection ratio, row similarity threshold, LCS row budget) is exposed via `GridOptions` with sensible defaults.
 
-- **Tested.** 43 unit tests + 2 doctests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, custom identity attributes, root tag rename detection, asymmetric grid widths, 300K-line diff without OOM).
+- **Tested.** 42 unit tests + 3 doctests covering edge cases (empty inputs, inserted rows/columns, keyless node bubbling, budget fallback, root tag rename detection, asymmetric grid widths, 300K-line diff without OOM).
 
 ## License
 

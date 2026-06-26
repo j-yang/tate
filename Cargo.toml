@@ -5,6 +5,7 @@ edition = "2021"
 license = "MIT"
 description = "A self-contained structured diff library for Rust — line diff, grid alignment, tree comparison, and inline word-level highlighting"
 repository = "https://github.com/j-yang/tate"
+readme = "README.md"
 keywords = ["diff", "compare", "alignment", "lcs", "structured"]
 categories = ["text-processing", "development-tools"]
 
