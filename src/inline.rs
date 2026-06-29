@@ -130,6 +130,54 @@ impl Op {
     }
 }
 
+/// Diff statistics derived from an edit script.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Stats {
+    #[cfg_attr(feature = "serde", serde(rename = "additions"))]
+    pub additions: usize,
+    #[cfg_attr(feature = "serde", serde(rename = "deletions"))]
+    pub deletions: usize,
+    pub modified: usize,
+    pub unchanged: usize,
+}
+
+impl Stats {
+    /// `true` when the diff contains no changes.
+    pub fn is_clean(&self) -> bool {
+        self.additions + self.deletions + self.modified == 0
+    }
+
+    /// Total number of changed lines (additions + deletions + modified).
+    pub fn changed(&self) -> usize {
+        self.additions + self.deletions + self.modified
+    }
+}
+
+/// Count additions, deletions, modifications, and unchanged lines in an edit
+/// script.
+///
+/// ```
+/// use tate::lines::diff;
+/// use tate::inline::stats;
+///
+/// let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
+/// let s = stats(&ops);
+/// assert_eq!(s.changed(), 2); // 1 delete + 1 insert
+/// ```
+pub fn stats(ops: &[Op]) -> Stats {
+    let mut s = Stats::default();
+    for op in ops {
+        match op.typ {
+            OpType::Equal => s.unchanged += 1,
+            OpType::Insert => s.additions += 1,
+            OpType::Delete => s.deletions += 1,
+            OpType::Replace => s.modified += 1,
+        }
+    }
+    s
+}
+
 /// Pair consecutive delete+insert blocks in `ops` into `Replace` ops.
 ///
 /// `ops` should come from a line-diff engine that only emits `Equal | Delete |

@@ -16,7 +16,7 @@
 //!    (≤ 16M cells), or block replacement (> 16M cells, correct but not minimal).
 //!
 //! The output is a flat `Vec<Op>` of `Equal | Delete | Insert`. `Replace` is
-//! never emitted here — feed the result into [`crate::inline::pair_replacements`]
+//! never emitted here — feed the result through [`crate::inline::pair_replacements`]
 //! to merge adjacent delete+insert pairs into `Replace` rows with word-level
 //! inline segments.
 
@@ -34,6 +34,9 @@ const MAX_HIRSCHBERG_CELLS: usize = 16 << 20;
 
 /// Diff two line sequences and return an edit script.
 ///
+/// Accepts any slice of `AsRef<str>` — `&[String]`, `&[&str]`, `&[Cow<str>]`,
+/// etc. — so callers can diff borrowed or owned data without conversion.
+///
 /// Only emits `Equal | Delete | Insert` — never `Replace`. To get `Replace`
 /// rows with inline word-level highlights, pass the result through
 /// [`crate::inline::pair_replacements`].
@@ -42,22 +45,24 @@ const MAX_HIRSCHBERG_CELLS: usize = 16 << 20;
 /// use tate::lines::diff;
 /// use tate::inline::{pair_replacements, OpType, DEFAULT_SIMILARITY};
 ///
-/// let a = vec!["foo".into(), "bar baz".into(), "qux".into()];
-/// let b = vec!["foo".into(), "bar qux".into(), "qux".into()];
+/// let a: Vec<String> = vec!["foo".into(), "bar baz".into(), "qux".into()];
+/// let b: Vec<String> = vec!["foo".into(), "bar qux".into(), "qux".into()];
 /// let ops = diff(&a, &b);
 /// let paired = pair_replacements(ops, DEFAULT_SIMILARITY);
 /// assert_eq!(paired[1].typ, OpType::Replace);
 /// ```
-pub fn diff(a: &[String], b: &[String]) -> Vec<Op> {
+pub fn diff<A: AsRef<str>, B: AsRef<str>>(a: &[A], b: &[B]) -> Vec<Op> {
+    let a: Vec<&str> = a.iter().map(AsRef::as_ref).collect();
+    let b: Vec<&str> = b.iter().map(AsRef::as_ref).collect();
     let mut out: Vec<Op> = Vec::with_capacity(a.len() + b.len());
-    diff_into(a, b, 0, 0, &mut out);
+    diff_into(&a, &b, 0, 0, &mut out);
     out
 }
 
-fn diff_into(a: &[String], b: &[String], mut off_a: usize, mut off_b: usize, out: &mut Vec<Op>) {
+fn diff_into(a: &[&str], b: &[&str], mut off_a: usize, mut off_b: usize, out: &mut Vec<Op>) {
     let mut p = 0;
     while p < a.len() && p < b.len() && a[p] == b[p] {
-        out.push(Op::equal(off_a + p, off_b + p, &a[p], &b[p]));
+        out.push(Op::equal(off_a + p, off_b + p, a[p], b[p]));
         p += 1;
     }
     off_a += p;
@@ -77,19 +82,19 @@ fn diff_into(a: &[String], b: &[String], mut off_a: usize, mut off_b: usize, out
     for t in 0..s {
         let ai = a_mid.len() + t;
         let bi = b_mid.len() + t;
-        out.push(Op::equal(off_a + ai, off_b + bi, &a[ai], &b[bi]));
+        out.push(Op::equal(off_a + ai, off_b + bi, a[ai], b[bi]));
     }
 }
 
-fn diff_middle(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
+fn diff_middle(a: &[&str], b: &[&str], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
     if a.is_empty() {
-        for (j, bv) in b.iter().enumerate() {
+        for (j, bv) in b.iter().copied().enumerate() {
             out.push(Op::insert(off_b + j, bv));
         }
         return;
     }
     if b.is_empty() {
-        for (i, av) in a.iter().enumerate() {
+        for (i, av) in a.iter().copied().enumerate() {
             out.push(Op::delete(off_a + i, av));
         }
         return;
@@ -104,24 +109,24 @@ fn diff_middle(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut
     let (mut prev_a, mut prev_b) = (0usize, 0usize);
     for an in &anchors {
         diff_into(&a[prev_a..an.a], &b[prev_b..an.b], off_a + prev_a, off_b + prev_b, out);
-        out.push(Op::equal(off_a + an.a, off_b + an.b, &a[an.a], &b[an.b]));
+        out.push(Op::equal(off_a + an.a, off_b + an.b, a[an.a], b[an.b]));
         prev_a = an.a + 1;
         prev_b = an.b + 1;
     }
     diff_into(&a[prev_a..], &b[prev_b..], off_a + prev_a, off_b + prev_b, out);
 }
 
-fn solve_exact(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
+fn solve_exact(a: &[&str], b: &[&str], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
     let cells = a.len().saturating_mul(b.len());
     if cells <= MAX_LCS_CELLS {
         lcs_full(a, b, off_a, off_b, out);
     } else if cells <= MAX_HIRSCHBERG_CELLS {
         hirschberg(a, b, off_a, off_b, out);
     } else {
-        for (i, av) in a.iter().enumerate() {
+        for (i, av) in a.iter().copied().enumerate() {
             out.push(Op::delete(off_a + i, av));
         }
-        for (j, bv) in b.iter().enumerate() {
+        for (j, bv) in b.iter().copied().enumerate() {
             out.push(Op::insert(off_b + j, bv));
         }
     }
@@ -133,31 +138,29 @@ struct AnchorPair {
     b: usize,
 }
 
-/// patience_anchors finds lines that occur exactly once in both a and b, then
-/// returns the longest increasing subsequence of those matches (by position).
-fn patience_anchors(a: &[String], b: &[String]) -> Vec<AnchorPair> {
+fn patience_anchors(a: &[&str], b: &[&str]) -> Vec<AnchorPair> {
     use std::collections::HashMap;
     let mut count_a: HashMap<&str, i32> = HashMap::with_capacity(a.len());
     for x in a {
-        *count_a.entry(x.as_str()).or_insert(0) += 1;
+        *count_a.entry(*x).or_insert(0) += 1;
     }
     let mut count_b: HashMap<&str, i32> = HashMap::with_capacity(b.len());
     for x in b {
-        *count_b.entry(x.as_str()).or_insert(0) += 1;
+        *count_b.entry(*x).or_insert(0) += 1;
     }
     let mut pos_b: HashMap<&str, usize> = HashMap::with_capacity(b.len());
     for (j, x) in b.iter().enumerate() {
-        if count_b[x.as_str()] == 1 {
-            pos_b.insert(x.as_str(), j);
+        if *count_b.get(*x).unwrap_or(&0) == 1 {
+            pos_b.insert(*x, j);
         }
     }
 
     let mut seq: Vec<AnchorPair> = Vec::new();
     for (i, x) in a.iter().enumerate() {
-        if count_a[x.as_str()] != 1 {
+        if *count_a.get(*x).unwrap_or(&0) != 1 {
             continue;
         }
-        if let Some(&j) = pos_b.get(x.as_str()) {
+        if let Some(&j) = pos_b.get(*x) {
             seq.push(AnchorPair { a: i, b: j });
         }
     }
@@ -195,18 +198,17 @@ fn patience_anchors(a: &[String], b: &[String]) -> Vec<AnchorPair> {
     out
 }
 
-/// Exact O(n*m) LCS via a full DP matrix.
-fn lcs_full(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
+fn lcs_full(a: &[&str], b: &[&str], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
     let (n, m) = (a.len(), b.len());
     let stride = m + 1;
     let mut dp = vec![0i32; (n + 1) * stride];
     for i in 1..=n {
-        let ai = &a[i - 1];
+        let ai = a[i - 1];
         let (prev_part, cur_part) = dp.split_at_mut(i * stride);
         let prev_row = &prev_part[(i - 1) * stride..(i - 1) * stride + stride];
         let row = &mut cur_part[..stride];
         for j in 1..=m {
-            if *ai == b[j - 1] {
+            if ai == b[j - 1] {
                 row[j] = prev_row[j - 1] + 1;
             } else if prev_row[j] >= row[j - 1] {
                 row[j] = prev_row[j];
@@ -220,30 +222,29 @@ fn lcs_full(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut Ve
     let (mut i, mut j) = (n, m);
     while i > 0 || j > 0 {
         if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
-            tmp.push(Op::equal(off_a + i - 1, off_b + j - 1, &a[i - 1], &b[j - 1]));
+            tmp.push(Op::equal(off_a + i - 1, off_b + j - 1, a[i - 1], b[j - 1]));
             i -= 1;
             j -= 1;
         } else if j > 0 && (i == 0 || dp[i * stride + j - 1] >= dp[(i - 1) * stride + j]) {
-            tmp.push(Op::insert(off_b + j - 1, &b[j - 1]));
+            tmp.push(Op::insert(off_b + j - 1, b[j - 1]));
             j -= 1;
         } else {
-            tmp.push(Op::delete(off_a + i - 1, &a[i - 1]));
+            tmp.push(Op::delete(off_a + i - 1, a[i - 1]));
             i -= 1;
         }
     }
     out.extend(tmp.into_iter().rev());
 }
 
-/// Hirschberg: exact LCS in O(n*m) time but O(min(n,m)) space.
-fn hirschberg(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
+fn hirschberg(a: &[&str], b: &[&str], off_a: usize, off_b: usize, out: &mut Vec<Op>) {
     if a.is_empty() {
-        for (j, bv) in b.iter().enumerate() {
+        for (j, bv) in b.iter().copied().enumerate() {
             out.push(Op::insert(off_b + j, bv));
         }
         return;
     }
     if b.is_empty() {
-        for (i, av) in a.iter().enumerate() {
+        for (i, av) in a.iter().copied().enumerate() {
             out.push(Op::delete(off_a + i, av));
         }
         return;
@@ -257,18 +258,18 @@ fn hirschberg(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut 
             }
         }
         if idx < 0 {
-            out.push(Op::delete(off_a, &a[0]));
-            for (j, bv) in b.iter().enumerate() {
+            out.push(Op::delete(off_a, a[0]));
+            for (j, bv) in b.iter().copied().enumerate() {
                 out.push(Op::insert(off_b + j, bv));
             }
             return;
         }
         let idx = idx as usize;
-        for (j, bv) in b[..idx].iter().enumerate() {
+        for (j, bv) in b[..idx].iter().copied().enumerate() {
             out.push(Op::insert(off_b + j, bv));
         }
-        out.push(Op::equal(off_a, off_b + idx, &a[0], &b[idx]));
-        for (j, bv) in b[idx + 1..].iter().enumerate() {
+        out.push(Op::equal(off_a, off_b + idx, a[0], b[idx]));
+        for (j, bv) in b[idx + 1..].iter().copied().enumerate() {
             out.push(Op::insert(off_b + idx + 1 + j, bv));
         }
         return;
@@ -292,19 +293,17 @@ fn hirschberg(a: &[String], b: &[String], off_a: usize, off_b: usize, out: &mut 
     hirschberg(&a[mid..], &b[best_k..], off_a + mid, off_b + best_k, out);
 }
 
-/// One LCS DP row using two rolling arrays (linear space). When `rev` is true,
-/// computes from the end so result[m] = LCS(a, last m of b).
-fn lcs_row(a: &[String], b: &[String], rev: bool) -> Vec<i32> {
+fn lcs_row(a: &[&str], b: &[&str], rev: bool) -> Vec<i32> {
     let mut prev = vec![0i32; b.len() + 1];
     let mut cur = vec![0i32; b.len() + 1];
-    let at = |s: &[String], i: usize| -> usize {
+    let at = |s: &[&str], i: usize| -> usize {
         if rev { s.len() - 1 - i } else { i }
     };
     for i in 0..a.len() {
-        let ai = &a[at(a, i)];
+        let ai = a[at(a, i)];
         for j in 1..=b.len() {
-            let bj = &b[at(b, j - 1)];
-            if *ai == *bj {
+            let bj = b[at(b, j - 1)];
+            if ai == bj {
                 cur[j] = prev[j - 1] + 1;
             } else if prev[j] >= cur[j - 1] {
                 cur[j] = prev[j];
@@ -370,6 +369,15 @@ mod tests {
     }
 
     #[test]
+    fn diff_accepts_str_slices() {
+        let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
+        assert_eq!(ops.len(), 4); // Equal, Delete, Insert, Equal
+        assert_eq!(ops[0].typ, OpType::Equal);
+        assert_eq!(ops[1].typ, OpType::Delete);
+        assert_eq!(ops[2].typ, OpType::Insert);
+    }
+
+    #[test]
     fn diff_matches_full_lcs() {
         let mk = |n: usize, md: usize| -> Vec<String> {
             (0..n).map(|i| format!("line-{}", i % md)).collect()
@@ -379,8 +387,10 @@ mod tests {
             let b = mk(m, md * 2);
             let ops = diff(&a, &b);
             validate(&a, &b, &ops);
+            let a_refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+            let b_refs: Vec<&str> = b.iter().map(|s| s.as_str()).collect();
             let mut reference: Vec<Op> = Vec::new();
-            lcs_full(&a, &b, 0, 0, &mut reference);
+            lcs_full(&a_refs, &b_refs, 0, 0, &mut reference);
             assert_eq!(lcs_len(&ops), lcs_len(&reference), "LCS len mismatch n={n} m={m} mod={md}");
         }
     }
@@ -407,8 +417,10 @@ mod tests {
     fn hirschberg_direct() {
         let a = sv(&["q", "w", "e", "r", "t"]);
         let b = sv(&["w", "r", "t", "z"]);
+        let a_refs: Vec<&str> = a.iter().map(|s| s.as_str()).collect();
+        let b_refs: Vec<&str> = b.iter().map(|s| s.as_str()).collect();
         let mut out: Vec<Op> = Vec::new();
-        hirschberg(&a, &b, 0, 0, &mut out);
+        hirschberg(&a_refs, &b_refs, 0, 0, &mut out);
         validate(&a, &b, &out);
     }
 
