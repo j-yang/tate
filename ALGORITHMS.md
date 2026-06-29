@@ -130,88 +130,78 @@ The optimal pairing is solvable via the assignment problem (Hungarian algorithm,
 
 ### Problem
 
-Given two tables (2D grids of strings) A = [n×k] and B = [m×l], produce one aligned grid with per-cell status (equal/modified/added/removed), detecting row insertions/deletions/modifications and column insertions/deletions.
+Given two tables A (m₁ × n₁) and B (m₂ × n₂) of strings, produce one aligned grid with per-cell status (equal/modified/added/removed), detecting row and column insertions, deletions, and modifications.
 
-### Algorithm: Sequential Column-Then-Row LCS
+### Algorithm: Coordinate Descent (v0.2.0)
+
+The **table edit distance** problem is NP-hard (reduction from Maximum Biclique, see formalization below). tate approximates it via **coordinate descent** — alternating between two polynomial-time sub-problems until convergence.
+
+**Step 1: Initialize alignment**
+
+Default: **positional** (identity) alignment — row i ↔ row i, column j ↔ column j. Zero assumption.
+
+When the caller provides `Init::Header { a, b }`: LCS on header text seeds the initial column alignment. The header is a **prior** (informed starting point), not a constraint — the algorithm still runs coordinate descent afterward and may override it.
+
+**Step 2: Coordinate descent loop**
 
 ```
-detect_header → align_columns (header LCS) → align_rows (signature LCS) → repair_gap → render
+for _ in 0..max_iters:
+    new_rows = align_1d(row_keys, row_similarity)    # fix columns, optimize rows
+    new_cols = align_1d(col_keys, col_similarity)    # fix rows, optimize columns
+    if new_cols == col_align && new_rows == row_align: break  # converged
 ```
 
-**Step 1: Header detection**
+Each `align_1d` call:
+1. Compute hash keys per element (row or column). Two elements with the same key are equal across all aligned positions — LCS can compare keys in O(1).
+2. Run LCS on keys → Equal / Delete / Insert.
+3. **Repair gap**: for each Delete+Insert block, greedily match elements by similarity (fraction of equal cells). Pairs at or above the cost-derived threshold become Modified; leftovers stay pure delete/insert.
 
-Find the first row that fills ≥ `header_fill_ratio` (default 0.8) of the grid width. This row's cells serve as column identity tokens.
+Rows and columns use the **same** `align_1d` subroutine — they are duals.
 
-Each side detects its header independently using its own width (not a shared max width).
+**Step 3: Render**
 
-**Step 2: Column alignment via header LCS**
-
-- Normalize header cells: trim + lowercase.
-- Run LCS on the two header sequences.
-- LCS Equal → column slot with both a_col and b_col.
-- LCS Delete → column exists only in A (removed).
-- LCS Insert → column exists only in B (added).
-
-If no usable header on either side: fall back to positional 1:1 column slots.
-
-**Step 3: Row signature construction**
-
-- For each row, extract cells at the aligned (common) column indices only.
-- Join them with `\u{0}` (NUL) separator to form a signature string.
-- This makes row comparison insensitive to inserted/removed columns.
-
-**Step 4: Row alignment via signature LCS**
-
-- Run LCS on the signature sequences.
-- LCS Equal → rows matched (may still have cell-level differences in non-common columns).
-- LCS Delete + Insert → collected into pending_del / pending_ins buffers.
-
-**Step 5: Iterative refinement (coordinate descent)**
-
-After the initial header-based column alignment and LCS row alignment, tate
-alternates:
-
-1. **Re-align columns by data**: Using the row-matched pairs, compute a
-   per-column similarity matrix (fraction of matched rows where A's column i
-   equals B's column j). Greedily match highest-similarity column pairs
-   (threshold 0.5), creating matched slots. Remaining columns become one-sided.
-2. **Re-align rows**: With the improved column slots, re-run LCS on row
-   signatures. This may match rows that were previously unmatched (because
-   the column alignment improved the signatures).
-3. **Convergence check**: If column slots and row pairs both stabilise, stop.
-   Maximum `refinement_iters` (default 2).
-
-Each iteration can only improve or maintain alignment quality (monotone
-non-increasing cost). The algorithm converges in finite steps to a local
-optimum. This is **coordinate descent** applied to the coupled row-column
-optimization problem.
-
-The initial column alignment uses header text only. The refinement uses
-**all matched row data** — catching column correspondences that headers
-alone miss (renamed headers, missing headers, data-driven columns).
-
-**Step 6: Render**
-
-For each row pair, walk the column slots and produce CellChange per cell:
-- Both sides present, cells differ → Modified (with word-level inline segments)
+For each row pair, walk the column pairs and produce `CellChange` per cell:
+- Both sides present, cells differ → Modified (with word-level inline segments via `inline_segments`)
 - Both sides present, cells equal → Equal
 - Only A → Removed
 - Only B → Added
 
-Modified cells carry `old_segs` / `new_segs` from
-[`inline_segments`](#module-2-inline--word-level-highlighting), enabling
-word-level highlighting within individual cells.
+Tables exceeding `max_rows` (default 4000) skip coordinate descent entirely and use positional alignment only.
 
-If a row budget (`lcs_row_budget`, default 4000) is exceeded, LCS is
-skipped and rows are aligned positionally; iterative refinement is also
-disabled.
+### Cost model
+
+All thresholds are derived from three cost parameters — no magic numbers:
+
+```rust
+pub struct Cost {
+    pub row: f64,    // α — insert/delete a row
+    pub col: f64,    // β — insert/delete a column
+    pub cell: f64,   // γ — modify a cell
+}
+```
+
+**Modify threshold**: a Delete+Insert pair becomes Modified when modification is cheaper than delete+insert:
+
+```
+(1 − similarity) × n × γ < 2α
+⟺  similarity > 1 − 2α / (nγ)
+```
+
+With default costs (α=γ=1):
+
+| Aligned columns (n) | Threshold | Interpretation |
+|---------------------|-----------|----------------|
+| 1 | −1 | Always pair (modify always cheaper) |
+| 2 | 0 | Pair if any cell matches |
+| 4 | 0.5 | Pair if ≥50% cells match |
+| 10 | 0.8 | Pair if ≥80% cells match |
 
 ### Theoretical properties
 
-- **Row alignment is optimal** given fixed column alignment: LCS on signatures produces the minimum-edit row script for the aligned columns.
-- **Column alignment via header LCS is greedy**: not globally optimal for column matching.
-- **Iterative refinement converges**: coordinate descent on a finite space, monotone cost decrease, reaches a local optimum in ≤ `refinement_iters` passes.
-- **The joint problem is NP-hard** (see formalization below), so no polynomial-time exact algorithm exists unless P=NP. The iterative refinement is a principled heuristic with a clear theoretical position.
+- **Each sub-problem is optimal**: given fixed column alignment, `align_1d` produces the minimum-edit row script (LCS is optimal for 1D). Symmetrically for columns.
+- **Convergence**: coordinate descent on a finite space with monotonically decreasing cost → converges in ≤ `max_iters` steps to a local optimum.
+- **No global optimality guarantee**: the joint problem is NP-hard. The local optimum quality depends on initialization (positional vs header).
+- **Header is a prior, not a constraint**: the algorithm's correctness and convergence do not depend on header detection. A better prior merely accelerates convergence and avoids bad local optima.
 
 ---
 
@@ -241,99 +231,27 @@ disabled.
 
 **FPT result.** When the column count is small (m₁,m₂ ≤ 20), the problem is fixed-parameter tractable: enumerate all O(2^(m₁+m₂)) column alignments, solve each with a 1D row DP, take the minimum. Time: O(2^(m₁+m₂) · n₁·n₂).
 
-**The problem:** LCS finds the longest common *subsequence* of header cells. If columns are reordered (same set, different order), LCS reports some as deleted and re-added.
+**Gap 1: No move detection (row/column reordering)**
+
+**The problem:** LCS finds the longest common *subsequence*, not *subset*. If columns are reordered (same set, different order), LCS reports some as deleted and re-added.
 
 **Concrete failure:**
 ```
 A: | name | age  | role  |     B: | name | role  | age  |
 ```
-Header LCS: [name] only (age and role are in reversed order, not a common subsequence).
+LCS: [name] only (age and role are in reversed order).
 Result: 2 columns deleted + 2 columns added = 4 column changes.
 Reality: 0 changes (columns just reordered).
 
-**Root cause:** LCS models "common subsequence" not "common set" or "permutation". It cannot detect that the same columns exist in a different order.
-
-**Impact:** Any table where columns are rearranged between versions produces a noisy diff with many spurious column add/delete operations.
+**Root cause:** The Table Edit Distance model has no "move" operation. Adding one would make the problem even harder (related to minimum common string partition). An order-free matching mode (e.g., Hungarian algorithm) could be added as an alternative to LCS in `align_1d`.
 
 ---
 
-### Gap 2: No formal definition of "optimal table diff"
+**Gap 2: Local optima in coordinate descent**
 
-**The problem:** There is no accepted formal definition of table edit distance analogous to:
-- Levenshtein distance for sequences (insert/delete/substitute, cost 1 each)
-- Zhang-Shasha for trees (insert/delete/relable nodes)
+Coordinate descent converges to a **local** optimum, not necessarily global. With positional initialization, pathological tables (massive column reordering) may converge to a bad local optimum. The `Init::Header` prior mitigates this for tables with headers.
 
-Without a formal cost model, we cannot:
-- Prove that grid_diff's output is within a factor of k of optimal.
-- Compare different algorithms on a theoretical basis.
-- Reason about which operations should be "cheap" vs "expensive".
-
-**Proposed formalization:**
-
-Define table edit distance τ(A, B) as the minimum cost of a sequence of operations transforming A into B, where the operation set is:
-
-| Operation | Cost | Effect |
-|-----------|------|--------|
-| insert_row(i, values) | 1 | Add a row at position i |
-| delete_row(i) | 1 | Remove row i |
-| modify_cell(i, j, v) | 1 | Change cell (i,j) to v |
-| insert_col(j, values) | 1 | Add a column at position j |
-| delete_col(j) | 1 | Remove column j |
-| swap_rows(i, i') | 1 | Exchange rows i and i' |
-| swap_cols(j, j') | 1 | Exchange columns j and j' |
-
-**Complexity:** Without swap operations, the problem decomposes into independent row and column alignment (each solvable by LCS in polynomial time). With swaps, the problem likely becomes NP-hard (related to the minimum common string partition problem). The exact complexity is an open question.
-
-**Current algorithm's relationship to this definition:** grid_diff solves a restricted version (no swaps, column alignment via header LCS, row alignment via signature LCS). Its cost is an upper bound on τ(A, B), but the gap between grid_diff's cost and τ(A, B) is unbounded in the worst case (column reorder case above produces O(k) spurious changes when τ = 0).
-
----
-
-### Gap 3: Sequential dependency propagates column errors to rows
-
-**The problem:** Row alignment depends on column alignment. If columns are misaligned, row signatures are computed on wrong columns, causing row pairing errors.
-
-**Concrete failure:**
-```
-A: | id | name   |     B: | id | label  |
-   | 1  | Alice  |        | 1  | Alice  |
-   | 2  | Bob    |        | 2  | Bobby  |
-```
-If header LCS fails to match "name"↔"label" (different text), column alignment treats them as delete+add.
-Row signatures use only [id] → "1" and "2" match on both sides → row 2 appears Equal.
-But "Bob" → "Bobby" should be a Modified cell — it's invisible because the column was dropped.
-
-**This is the most impactful gap for practical diff quality.**
-
----
-
-### Proposed Improvement: Iterative Refinement
-
-Instead of the current one-pass column→row pipeline:
-
-```
-align_columns (using headers)
-    ↓
-align_rows (using column-aligned signatures)
-    ↓ DONE
-```
-
-Use alternating optimization:
-
-```
-C₀ = align_columns(headers)
-R₀ = align_rows(C₀, row_signatures)
-loop {
-    C_{i+1} = align_columns(R_i, column_signatures)  // re-align using row-matched data
-    R_{i+1} = align_rows(C_{i+1}, row_signatures)    // re-align using updated columns
-    if C_{i+1} == C_i && R_{i+1} == R_i { break }     // converged
-}
-```
-
-**Intuition:** After the first row alignment, we know which rows correspond. We can use this correspondence to build better column signatures (comparing cells across matched rows, not just headers). This may detect column renames or reorderings that header-only LCS missed.
-
-**Convergence:** Each iteration can only improve or maintain the alignment quality (monotone non-increasing cost). Since there are finitely many possible alignments, the algorithm converges in finite steps. Whether convergence is fast (poly iterations) is an open question.
-
-**This approach is unpublished in the table/spreadsheet diff literature to our knowledge.**
+**Potential mitigation:** Multiple random restarts, or FPT exact solver for small column counts (see formalization above).
 
 ---
 
