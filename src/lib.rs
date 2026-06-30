@@ -19,6 +19,8 @@
 //!   style) with hunks and context lines.
 //! - [`merge`] — 3-way merge: combine changes from two branches that diverged
 //!   from a common base, with conflict detection.
+//! - [`change`] — versioned change sets: diff results with metadata (version
+//!   labels, timestamp, author) for audit and cross-language pipelines.
 //!
 //! Typical pipeline for text file diff:
 //! ```
@@ -51,6 +53,7 @@
 //! assert_eq!(result.lines, vec!["a", "X", "Y"]);
 //! ```
 
+pub mod change;
 pub mod grid;
 pub mod inline;
 pub mod lines;
