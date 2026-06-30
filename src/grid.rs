@@ -401,8 +401,8 @@ fn align_rows(
 
     let cols_a: Vec<usize> = common.iter().map(|(c, _)| *c).collect();
     let cols_b: Vec<usize> = common.iter().map(|(_, c)| *c).collect();
-    let keys_a = compute_keys(a, &cols_a, true);
-    let keys_b = compute_keys(b, &cols_b, true);
+    let keys_a = compute_row_keys(a, &cols_a);
+    let keys_b = compute_row_keys(b, &cols_b);
 
     let n = common.len();
     let threshold = modify_threshold(cost.row, cost.cell, n);
@@ -468,23 +468,18 @@ fn align_cols(
 
 // ─── Key computation ─────────────────────────────────────────────────────────
 
-/// Compute a hash key per row (when `by_row`) or per column. Two elements with
-/// the same key are guaranteed equal across all aligned positions, so LCS can
-/// compare keys in O(1).
-fn compute_keys(rows: &[Vec<String>], indices: &[usize], by_row: bool) -> Vec<String> {
-    if by_row {
-        rows.iter()
-            .map(|row| {
-                let mut h = DefaultHasher::new();
-                for &c in indices {
-                    row.get(c).map(|s| s.as_str()).unwrap_or("").hash(&mut h);
-                }
-                format!("{:016x}", h.finish())
-            })
-            .collect()
-    } else {
-        compute_col_keys(rows, indices, indices.len())
-    }
+/// Compute a hash key per row. Two rows with the same key are guaranteed equal
+/// across all aligned column positions, so LCS can compare keys in O(1).
+fn compute_row_keys(rows: &[Vec<String>], col_indices: &[usize]) -> Vec<String> {
+    rows.iter()
+        .map(|row| {
+            let mut h = DefaultHasher::new();
+            for &c in col_indices {
+                row.get(c).map(|s| s.as_str()).unwrap_or("").hash(&mut h);
+            }
+            format!("{:016x}", h.finish())
+        })
+        .collect()
 }
 
 fn compute_col_keys(rows: &[Vec<String>], row_indices: &[usize], width: usize) -> Vec<String> {

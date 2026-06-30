@@ -120,17 +120,8 @@ where
                 consumed_t += 1;
             }
 
-            // Also include base lines between the first change and the region end.
-            let o_actual_end = if consumed_o > 0 {
-                regions_ours[io + consumed_o - 1].base_end
-            } else {
-                o_end
-            };
-            let t_actual_end = if consumed_t > 0 {
-                regions_theirs[it + consumed_t - 1].base_end
-            } else {
-                t_end
-            };
+            let o_actual_end = regions_ours[io + consumed_o - 1].base_end;
+            let t_actual_end = regions_theirs[it + consumed_t - 1].base_end;
             let full_end = o_actual_end.max(t_actual_end);
 
             if o_repl == t_repl {
