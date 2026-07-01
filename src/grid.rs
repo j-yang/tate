@@ -188,6 +188,13 @@ pub struct GridOptions {
     pub max_rows: usize,
     /// Initialization strategy.
     pub init: Init,
+    /// Lock the column alignment to the initialization and never re-derive it
+    /// from cell content. When `true`, coordinate descent only re-aligns rows;
+    /// columns stay exactly as [`Init`] set them. Use with [`Init::Header`] when
+    /// the table has a stable header row (e.g. a fixed schema): a column whose
+    /// every value changed (a timestamp column, say) then stays one modified
+    /// column instead of being mis-read as a delete+insert of whole columns.
+    pub lock_columns: bool,
 }
 
 impl Default for GridOptions {
@@ -197,6 +204,7 @@ impl Default for GridOptions {
             max_iters: 3,
             max_rows: 4_000,
             init: Init::Positional,
+            lock_columns: false,
         }
     }
 }
@@ -224,7 +232,13 @@ pub fn grid_diff(
     if !too_many {
         for _ in 0..opts.max_iters {
             let new_rows = align_rows(rows_a, rows_b, &col_align, &opts.cost);
-            let new_cols = align_cols(rows_a, rows_b, &new_rows, &opts.cost);
+            // When columns are locked, keep the initialization alignment and
+            // only converge rows; otherwise re-derive columns from cell content.
+            let new_cols = if opts.lock_columns {
+                col_align.clone()
+            } else {
+                align_cols(rows_a, rows_b, &new_rows, &opts.cost)
+            };
             if new_cols == col_align && new_rows == row_align {
                 break;
             }
@@ -848,6 +862,38 @@ mod tests {
                 assert_eq!(row.cells[3].new, "21");
             }
         }
+    }
+
+    #[test]
+    fn lock_columns_keeps_full_changed_column_aligned() {
+        // Two tables, same header, but one whole column (col 1) has every value
+        // changed. Without lock_columns the content-based column alignment reads
+        // that as delete+insert of a column; with lock_columns + header init the
+        // column stays put and the changes are reported as modified rows.
+        let a = grid(&[
+            &["id", "time", "status"],
+            &["1", "09:00", "ok"],
+            &["2", "09:05", "ok"],
+            &["3", "09:10", "ok"],
+        ]);
+        let b = grid(&[
+            &["id", "time", "status"],
+            &["1", "10:00", "ok"],
+            &["2", "10:05", "ok"],
+            &["3", "10:10", "ok"],
+        ]);
+        let opts = GridOptions {
+            init: Init::Header { a: 0, b: 0 },
+            lock_columns: true,
+            ..GridOptions::default()
+        };
+        let gd = grid_diff(&a, &b, &opts);
+        assert_eq!(gd.added_cols, 0, "no columns should be added");
+        assert_eq!(gd.removed_cols, 0, "no columns should be removed");
+        assert_eq!(gd.columns.len(), 3);
+        assert!(gd.columns.iter().all(|c| c.status == Status::Equal));
+        // The three data rows each changed in the time column.
+        assert_eq!(gd.modified_rows, 3);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
 name = "tate"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 license = "MIT"
 description = "A self-contained structured diff library for Rust — line diff, grid alignment, tree comparison, unified diff output, 3-way merge, and inline word-level highlighting"
