@@ -19,6 +19,10 @@
 //!   style) with hunks and context lines.
 //! - [`merge`] — 3-way merge: combine changes from two branches that diverged
 //!   from a common base, with conflict detection.
+//! - [`grid`] — 2D grid alignment and 3-way grid merge (pushout of grid diffs).
+//! - [`tree`] — structural tree diff and 3-way tree merge.
+//! - [`patch`] — unified framework describing diff, merge, and conflict as
+//!   pushout computation in the groupoid of versioned structures.
 //! - [`change`] — versioned change sets: diff results with metadata (version
 //!   labels, timestamp, author) for audit and cross-language pipelines.
 //!
@@ -58,6 +62,7 @@ pub mod grid;
 pub mod inline;
 pub mod lines;
 pub mod merge;
+pub mod patch;
 pub mod tree;
 pub mod unified;
 

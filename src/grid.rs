@@ -691,6 +691,180 @@ pub fn col_letter(mut i: usize) -> String {
     String::from_utf8(b).unwrap()
 }
 
+// ─── 3-way merge ─────────────────────────────────────────────────────────────
+
+/// Result of a 3-way grid merge ([`grid_merge`]).
+///
+/// In the groupoid of grids, `grid_merge` computes the pushout of the two
+/// morphisms `base→ours` and `base→theirs`. When both sides change the same
+/// cell differently, the pushout is non-unique and a [`GridCellConflict`] is
+/// recorded.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GridMergeResult {
+    pub grid: Vec<Vec<String>>,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
+    pub conflicts: Vec<GridCellConflict>,
+}
+
+/// One cell-level conflict in a grid merge.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct GridCellConflict {
+    pub row: usize,
+    pub col: usize,
+    pub base: String,
+    pub ours: String,
+    pub theirs: String,
+}
+
+/// 3-way merge of two grids that diverged from a common base.
+///
+/// Uses the diff3 principle: compute `diff(base, ours)` and `diff(base, theirs)`
+/// independently, then walk the aligned rows. Independent changes are
+/// auto-merged; overlapping changes at the same cell are conflicts.
+///
+/// ```
+/// use tate::grid::{grid_merge, GridOptions};
+///
+/// let base: Vec<Vec<String>> = vec![vec!["A".into(), "B".into()], vec!["1".into(), "2".into()]];
+/// let ours: Vec<Vec<String>> = vec![vec!["A".into(), "B".into()], vec!["1".into(), "9".into()]];
+/// let theirs: Vec<Vec<String>> = vec![vec!["A".into(), "X".into()], vec!["1".into(), "2".into()]];
+/// let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+/// assert_eq!(r.conflicts.len(), 0);
+/// assert_eq!(r.grid[0], vec!["A", "X"]);
+/// assert_eq!(r.grid[1], vec!["1", "9"]);
+/// ```
+pub fn grid_merge(
+    base: &[Vec<String>],
+    ours: &[Vec<String>],
+    theirs: &[Vec<String>],
+    opts: &GridOptions,
+) -> GridMergeResult {
+    let diff_o = grid_diff(base, ours, opts);
+    let diff_t = grid_diff(base, theirs, opts);
+
+    let theirs_map: std::collections::HashMap<usize, usize> = diff_t
+        .rows
+        .iter()
+        .filter(|r| r.row_a > 0 && r.row_b > 0)
+        .map(|r| (r.row_a - 1, r.row_b - 1))
+        .collect();
+
+    let mut theirs_used: std::collections::HashSet<usize> =
+        theirs_map.values().copied().collect();
+
+    let mut grid: Vec<Vec<String>> = Vec::new();
+    let mut conflicts: Vec<GridCellConflict> = Vec::new();
+
+    for gr in &diff_o.rows {
+        let base_idx = (gr.row_a > 0).then(|| gr.row_a - 1);
+        let ours_idx = (gr.row_b > 0).then(|| gr.row_b - 1);
+
+        match (base_idx, ours_idx) {
+            (Some(bi), Some(oi)) => match theirs_map.get(&bi) {
+                Some(&ti) => {
+                    let merged_row = merge_cells(
+                        &base[bi],
+                        &ours[oi],
+                        &theirs[ti],
+                        grid.len(),
+                        &mut conflicts,
+                    );
+                    grid.push(merged_row);
+                }
+                None => {
+                    if rows_differ(&base[bi], &ours[oi]) {
+                        conflicts.push(GridCellConflict {
+                            row: grid.len(),
+                            col: 0,
+                            base: String::new(),
+                            ours: String::new(),
+                            theirs: String::new(),
+                        });
+                    }
+                    grid.push(ours[oi].clone());
+                }
+            },
+            (Some(bi), None) => match theirs_map.get(&bi) {
+                Some(&ti) => {
+                    if rows_differ(&base[bi], &theirs[ti]) {
+                        conflicts.push(GridCellConflict {
+                            row: grid.len(),
+                            col: 0,
+                            base: String::new(),
+                            ours: String::new(),
+                            theirs: String::new(),
+                        });
+                    }
+                    grid.push(theirs[ti].clone());
+                }
+                None => {}
+            },
+            (None, Some(oi)) => {
+                grid.push(ours[oi].clone());
+            }
+            (None, None) => {}
+        }
+    }
+
+    for gr in &diff_t.rows {
+        if gr.row_a == 0 && gr.row_b > 0 {
+            let ti = gr.row_b - 1;
+            if !theirs_used.contains(&ti) {
+                grid.push(theirs[ti].clone());
+                theirs_used.insert(ti);
+            }
+        }
+    }
+
+    GridMergeResult { grid, conflicts }
+}
+
+fn merge_cells(
+    base: &[String],
+    ours: &[String],
+    theirs: &[String],
+    row_idx: usize,
+    conflicts: &mut Vec<GridCellConflict>,
+) -> Vec<String> {
+    let max_cols = base.len().max(ours.len()).max(theirs.len());
+    let mut result = Vec::with_capacity(max_cols);
+
+    for col in 0..max_cols {
+        let b = base.get(col).cloned().unwrap_or_default();
+        let o = ours.get(col).cloned().unwrap_or_default();
+        let t = theirs.get(col).cloned().unwrap_or_default();
+
+        if o == b && t == b {
+            result.push(b);
+        } else if o == b {
+            result.push(t);
+        } else if t == b {
+            result.push(o);
+        } else if o == t {
+            result.push(o);
+        } else {
+            conflicts.push(GridCellConflict {
+                row: row_idx,
+                col,
+                base: b.clone(),
+                ours: o.clone(),
+                theirs: t.clone(),
+            });
+            result.push(o);
+        }
+    }
+    result
+}
+
+fn rows_differ(a: &[String], b: &[String]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    a.iter().zip(b.iter()).any(|(x, y)| x != y)
+}
+
 // ─── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -914,5 +1088,78 @@ mod tests {
         let gd = grid_diff(&a, &b, &opts);
         let (_, _, modified, _) = counts(&gd);
         assert_eq!(modified, 1, "high row cost forces modified even with 0% similarity");
+    }
+
+    // ── grid_merge tests ──
+
+    #[test]
+    fn merge_independent_cell_changes() {
+        let base = grid(&[&["A", "B"], &["1", "2"]]);
+        let ours = grid(&[&["A", "B"], &["1", "9"]]);
+        let theirs = grid(&[&["X", "B"], &["1", "2"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.grid, grid(&[&["X", "B"], &["1", "9"]]));
+    }
+
+    #[test]
+    fn merge_conflicting_cell_change() {
+        let base = grid(&[&["A", "B"], &["1", "2"]]);
+        let ours = grid(&[&["A", "B"], &["1", "9"]]);
+        let theirs = grid(&[&["A", "B"], &["1", "8"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].col, 1);
+        assert_eq!(r.conflicts[0].base, "2");
+        assert_eq!(r.conflicts[0].ours, "9");
+        assert_eq!(r.conflicts[0].theirs, "8");
+    }
+
+    #[test]
+    fn merge_both_same_change() {
+        let base = grid(&[&["A", "B"], &["1", "2"]]);
+        let ours = grid(&[&["A", "Z"], &["1", "2"]]);
+        let theirs = grid(&[&["A", "Z"], &["1", "2"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.grid, grid(&[&["A", "Z"], &["1", "2"]]));
+    }
+
+    #[test]
+    fn merge_row_added_by_ours() {
+        let base = grid(&[&["id"], &["1"]]);
+        let ours = grid(&[&["id"], &["1"], &["2"]]);
+        let theirs = grid(&[&["id"], &["1"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert!(r.grid.len() >= 2);
+    }
+
+    #[test]
+    fn merge_row_added_by_both() {
+        let base = grid(&[&["id"], &["1"]]);
+        let ours = grid(&[&["id"], &["1"], &["2"]]);
+        let theirs = grid(&[&["id"], &["1"], &["3"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert!(r.grid.len() >= 3);
+    }
+
+    #[test]
+    fn merge_both_delete_row() {
+        let base = grid(&[&["id"], &["1"], &["2"], &["3"]]);
+        let ours = grid(&[&["id"], &["1"], &["3"]]);
+        let theirs = grid(&[&["id"], &["1"], &["3"]]);
+        let r = grid_merge(&base, &ours, &theirs, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.grid, grid(&[&["id"], &["1"], &["3"]]));
+    }
+
+    #[test]
+    fn merge_no_changes() {
+        let base = grid(&[&["A", "B"], &["1", "2"]]);
+        let r = grid_merge(&base, &base, &base, &GridOptions::default());
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.grid, base);
     }
 }
