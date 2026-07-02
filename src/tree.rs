@@ -145,6 +145,12 @@ pub struct TreeChange {
     /// Attribute changes for a `Modified` node; empty for `Added` / `Removed`.
     #[cfg_attr(feature = "serde", serde(rename = "changedAttrs", default, skip_serializing_if = "Vec::is_empty"))]
     pub changed_attrs: Vec<AttrChange>,
+    /// Text-content change for a `Modified` node, if its `text` differed:
+    /// `(old, new)`. `None` when the text was unchanged. Text is the scalar
+    /// payload of JSON values, XML text nodes, and grid cells, so a merge must
+    /// treat it on equal footing with attributes.
+    #[cfg_attr(feature = "serde", serde(rename = "changedText", default, skip_serializing_if = "Option::is_none"))]
+    pub changed_text: Option<(String, String)>,
 }
 
 /// The result of tree-diffing two [`TreeNode`]s.
@@ -181,7 +187,7 @@ pub fn tree_diff(a: &TreeNode, b: &TreeNode) -> TreeDiff {
     // Root fallback: if the whole tree changed but no locatable node was reported,
     // surface the root so the caller sees something.
     if changed && changes.is_empty() {
-        changes.push(mk_change(ChangeKind::Modified, b, attr_diffs(a, b), Vec::new()));
+        changes.push(mk_change(ChangeKind::Modified, b, attr_diffs(a, b), text_diff(a, b), Vec::new()));
     }
     TreeDiff { changes }
 }
@@ -202,7 +208,13 @@ fn is_locatable(n: &TreeNode) -> bool {
 }
 
 /// Build a change record for a node, pulling identity and label from the node.
-fn mk_change(kind: ChangeKind, n: &TreeNode, changed_attrs: Vec<AttrChange>, path: Vec<String>) -> TreeChange {
+fn mk_change(
+    kind: ChangeKind,
+    n: &TreeNode,
+    changed_attrs: Vec<AttrChange>,
+    changed_text: Option<(String, String)>,
+    path: Vec<String>,
+) -> TreeChange {
     TreeChange {
         kind,
         elem_type: n.kind.clone(),
@@ -210,6 +222,16 @@ fn mk_change(kind: ChangeKind, n: &TreeNode, changed_attrs: Vec<AttrChange>, pat
         label: n.label.clone(),
         path,
         changed_attrs,
+        changed_text,
+    }
+}
+
+/// The text change between two nodes, or `None` if their text is equal.
+fn text_diff(a: &TreeNode, b: &TreeNode) -> Option<(String, String)> {
+    if a.text != b.text {
+        Some((a.text.clone(), b.text.clone()))
+    } else {
+        None
     }
 }
 
@@ -305,7 +327,12 @@ fn diff_node(a: &TreeNode, b: &TreeNode, out: &mut Vec<TreeChange>, path: Vec<St
     }
 
     if locatable && (own_changed || descendant_changed) {
-        out.push(mk_change(ChangeKind::Modified, b, attr_changes, path));
+        let changed_text = if text_changed {
+            Some((a.text.clone(), b.text.clone()))
+        } else {
+            None
+        };
+        out.push(mk_change(ChangeKind::Modified, b, attr_changes, changed_text, path));
         own_changed = true;
     }
 
@@ -317,7 +344,7 @@ fn diff_node(a: &TreeNode, b: &TreeNode, out: &mut Vec<TreeChange>, path: Vec<St
 fn emit_subtree(kind: ChangeKind, n: &TreeNode, out: &mut Vec<TreeChange>, path: Vec<String>) -> bool {
     let mut reported = false;
     if is_locatable(n) {
-        out.push(mk_change(kind, n, Vec::new(), path.clone()));
+        out.push(mk_change(kind, n, Vec::new(), None, path.clone()));
         reported = true;
     }
     for c in &n.children {
@@ -351,6 +378,8 @@ pub struct TreeMergeResult {
 pub enum ConflictKind {
     /// Both sides set the same attribute on the same node to different values.
     Attr,
+    /// Both sides changed the same node's text content to different values.
+    Text,
     /// Both sides added a node at the same path with differing content.
     AddAdd,
     /// One side modified a node the other side removed.
@@ -463,6 +492,41 @@ fn detect_conflicts(
         }
     }
 
+    // (1b) text/text: both sides changed the same node's text differently.
+    let text_index = |diff: &TreeDiff| -> std::collections::HashMap<String, (String, String)> {
+        let mut m = std::collections::HashMap::new();
+        for c in &diff.changes {
+            if c.kind == ChangeKind::Modified {
+                if let Some(t) = &c.changed_text {
+                    m.insert(path_key(&c.path), t.clone());
+                }
+            }
+        }
+        m
+    };
+    let text_o = text_index(diff_o);
+    let text_t = text_index(diff_t);
+    for (pk, to) in &text_o {
+        if let Some(tt) = text_t.get(pk) {
+            // to = (base_text, ours_text), tt = (base_text, theirs_text).
+            if to.1 != tt.1 {
+                let path: Vec<String> = if pk.is_empty() {
+                    Vec::new()
+                } else {
+                    pk.split('/').map(String::from).collect()
+                };
+                conflicts.push(TreeConflict {
+                    kind: ConflictKind::Text,
+                    path,
+                    attr: String::new(),
+                    base: to.0.clone(),
+                    ours: to.1.clone(),
+                    theirs: tt.1.clone(),
+                });
+            }
+        }
+    }
+
     let paths_of = |diff: &TreeDiff, kind: ChangeKind| -> std::collections::HashSet<String> {
         diff.changes
             .iter()
@@ -549,14 +613,15 @@ fn mk_modify_delete(mod_diff: &TreeDiff, base: &TreeNode, pk: &str, ours_modifie
         .iter()
         .find(|c| c.kind == ChangeKind::Modified && path_key(&c.path) == pk)
         .map(|c| {
-            if c.changed_attrs.is_empty() {
+            let mut parts: Vec<String> =
+                c.changed_attrs.iter().map(|a| format!("{}={}", a.name, a.new)).collect();
+            if let Some((_, new_text)) = &c.changed_text {
+                parts.push(format!("text={new_text}"));
+            }
+            if parts.is_empty() {
                 "modified".to_string()
             } else {
-                c.changed_attrs
-                    .iter()
-                    .map(|a| format!("{}={}", a.name, a.new))
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                parts.join(", ")
             }
         })
         .unwrap_or_else(|| "modified".to_string());
@@ -594,6 +659,16 @@ fn merge_nodes(
         })
         .collect();
 
+    // Paths where ours changed the node's text — theirs' text change there is
+    // either a no-op (same value) or a conflict (already recorded), so we keep
+    // ours and do not overwrite.
+    let ours_text_modified: std::collections::HashSet<String> = diff_o
+        .changes
+        .iter()
+        .filter(|c| c.kind == ChangeKind::Modified && c.changed_text.is_some())
+        .map(|c| path_key(&c.path))
+        .collect();
+
     let ours_added_paths: std::collections::HashSet<String> = diff_o
         .changes
         .iter()
@@ -617,6 +692,14 @@ fn merge_nodes(
             let conflict_key = format!("{pk}#{}", a.name);
             if !ours_modified.contains(&conflict_key) {
                 apply_attr(&mut merged, &c.path, &a.name, &a.new);
+            }
+        }
+        // Apply theirs' text change unless ours also changed this node's text
+        // (a clean text edit on one side only auto-merges; a two-sided text
+        // change is either identical or already flagged as a Text conflict).
+        if let Some((_, new_text)) = &c.changed_text {
+            if !ours_text_modified.contains(&pk) {
+                apply_text(&mut merged, &c.path, new_text);
             }
         }
     }
@@ -662,6 +745,21 @@ fn set_attr(node: &mut TreeNode, name: &str, value: &str) {
         }
     }
     node.attributes.push((name.to_string(), value.to_string()));
+}
+
+/// Set the text content of the node at `path`, mirroring [`apply_attr`].
+fn apply_text(tree: &mut TreeNode, path: &[String], value: &str) {
+    if path.is_empty() {
+        tree.text = value.to_string();
+        return;
+    }
+    let key = &path[0];
+    for child in &mut tree.children {
+        if node_key(child) == *key {
+            apply_text(child, &path[1..], value);
+            return;
+        }
+    }
 }
 
 fn find_node_by_path<'a>(tree: &'a TreeNode, path: &[String]) -> Option<&'a TreeNode> {
@@ -977,6 +1075,63 @@ mod tests {
         assert_eq!(c.kind, ConflictKind::ModifyDelete);
         assert_eq!(c.ours, "deleted");
         assert!(c.theirs.contains("v=9"));
+    }
+
+    #[test]
+    fn text_change_is_applied_not_dropped() {
+        // ours changes text; theirs untouched → merge keeps ours' text.
+        // theirs changes a different node's text → both survive.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("a").with_identity("u1").with_text("1"))
+            .with_child(TreeNode::new("b").with_identity("u2").with_text("2"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("a").with_identity("u1").with_text("ONE"))
+            .with_child(TreeNode::new("b").with_identity("u2").with_text("2"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("a").with_identity("u1").with_text("1"))
+            .with_child(TreeNode::new("b").with_identity("u2").with_text("TWO"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 0, "disjoint text edits must not conflict");
+        assert_eq!(r.tree.children[0].text, "ONE", "ours' text kept");
+        assert_eq!(r.tree.children[1].text, "TWO", "theirs' text applied, not dropped");
+    }
+
+    #[test]
+    fn conflicting_text_change_is_recorded() {
+        // Both change the same node's text to different values → Text conflict.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("cell").with_identity("c1").with_text("orig"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("cell").with_identity("c1").with_text("mine"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("cell").with_identity("c1").with_text("yours"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 1);
+        let c = &r.conflicts[0];
+        assert_eq!(c.kind, ConflictKind::Text);
+        assert_eq!(c.path, vec!["cell#c1"]);
+        assert_eq!((c.base.as_str(), c.ours.as_str(), c.theirs.as_str()), ("orig", "mine", "yours"));
+    }
+
+    #[test]
+    fn same_text_change_both_sides_is_not_a_conflict() {
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("cell").with_identity("c1").with_text("orig"));
+        let side = TreeNode::new("root")
+            .with_child(TreeNode::new("cell").with_identity("c1").with_text("same"));
+        let r = tree_merge(&base, &side, &side);
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.tree.children[0].text, "same");
+    }
+
+    #[test]
+    fn text_change_reported_in_diff() {
+        // Regression: tree_diff must surface a text change in changed_text.
+        let a = TreeNode::new("root").with_child(TreeNode::new("n").with_identity("u1").with_text("old"));
+        let b = TreeNode::new("root").with_child(TreeNode::new("n").with_identity("u1").with_text("new"));
+        let d = tree_diff(&a, &b);
+        assert_eq!(d.changes.len(), 1);
+        assert_eq!(d.changes[0].changed_text, Some(("old".to_string(), "new".to_string())));
     }
 
     #[test]
