@@ -17,10 +17,10 @@
 //!   YAML, …) into `TreeNode` before calling `tree_diff`.
 //! - [`unified`] — render an edit script as unified diff text (`git diff`
 //!   style) with hunks and context lines.
-//! - [`merge`] — 3-way merge: combine changes from two branches that diverged
-//!   from a common base, with conflict detection.
-//! - [`grid`] — 2D grid alignment and 3-way grid merge (pushout of grid diffs).
-//! - [`tree`] — structural tree diff and 3-way tree merge.
+//! - [`grid`] — 2D grid alignment (row/column coordinate descent). Produces the
+//!   [`grid::GridDiff`] display result; also serves as a keying adapter that
+//!   turns an un-keyed grid into a stably-keyed tree for the merge algebra.
+//! - [`tree`] — structural tree diff and 3-way tree merge (the sole merge).
 //! - [`section`] — the canonical object: a [`section::Section`] is the flat
 //!   `location → value` form of a tree (the sheaf section the algebra runs on).
 //!   Convert with [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
@@ -52,20 +52,22 @@
 //! assert!(text.contains("@@"));
 //! ```
 //!
-//! 3-way merge:
+//! 3-way merge (the single merge, over trees):
 //! ```
-//! use tate::merge::merge;
+//! use tate::tree::{TreeNode, tree_merge};
 //!
-//! let result = merge(&["a", "b", "c"], &["a", "X", "c"], &["a", "b", "Y"]);
-//! assert_eq!(result.conflicts, 0);
-//! assert_eq!(result.lines, vec!["a", "X", "Y"]);
+//! let base = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+//! let ours = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
+//! let theirs = base.clone();
+//! let result = tree_merge(&base, &ours, &theirs);
+//! assert_eq!(result.conflicts.len(), 0);
+//! assert_eq!(result.tree.children[0].attr("v"), Some("9"));
 //! ```
 
 pub mod change;
 pub mod grid;
 pub mod inline;
 pub mod lines;
-pub mod merge;
 pub mod patch;
 pub mod section;
 pub mod tree;

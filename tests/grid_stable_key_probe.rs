@@ -30,7 +30,7 @@
 //! logic does not need to be duplicated.
 
 use std::collections::BTreeMap;
-use tate::grid::{grid_diff, grid_merge, GridOptions};
+use tate::grid::{grid_diff, GridOptions};
 use tate::section::{Section, Value};
 use tate::tree::tree_merge;
 
@@ -178,62 +178,45 @@ fn tree_path_merge(
     (stable_section_to_grid(&r.tree.to_section()), r.conflicts.len())
 }
 
-fn report(name: &str, base: &[Vec<String>], ours: &[Vec<String>], theirs: &[Vec<String>]) {
-    let opts = GridOptions::default();
-    let gm = grid_merge(base, ours, theirs, &opts);
-    let (tg, tc) = tree_path_merge(base, ours, theirs, &opts);
-    println!("=== {name} ===");
-    println!("  grid_merge -> {:?}  conflicts={}", gm.grid, gm.conflicts.len());
-    println!("  tree_path  -> {:?}  conflicts={}", tg, tc);
-    println!("  grids match: {}   conflict counts match: {}",
-        gm.grid == tg, gm.conflicts.len() == tc);
-}
+// The expected results below are exactly what the old `grid_merge` produced on
+// these inputs (captured before it was deleted). The tree path — key by the
+// alignment `grid_diff` computes, then `tree_merge` — must reproduce them. This
+// is the standing regression guard for "grid merge folds into tree merge".
 
 #[test]
 fn stable_key_disjoint_cell_edits() {
+    // ours edits (1,1); theirs edits (0,0). Disjoint → both kept, no conflict.
     let base = g(&[&["a", "b"], &["c", "d"]]);
     let ours = g(&[&["a", "b"], &["c", "X"]]);
     let theirs = g(&[&["Y", "b"], &["c", "d"]]);
-    report("disjoint cell edits", &base, &ours, &theirs);
 
-    let opts = GridOptions::default();
-    let gm = grid_merge(&base, &ours, &theirs, &opts);
-    let (tg, tc) = tree_path_merge(&base, &ours, &theirs, &opts);
-    // With stable keys, the tree path SHOULD now keep both edits.
-    assert_eq!(gm.grid, g(&[&["Y", "b"], &["c", "X"]]));
-    assert_eq!(tg, gm.grid, "stable-key tree path should match grid_merge on disjoint edits");
+    let (tg, tc) = tree_path_merge(&base, &ours, &theirs, &GridOptions::default());
+    assert_eq!(tg, g(&[&["Y", "b"], &["c", "X"]]), "tree path keeps both disjoint edits");
     assert_eq!(tc, 0);
 }
 
 #[test]
 fn stable_key_conflicting_cell_edit() {
+    // Both edit the same cell (1,1) differently → exactly one conflict.
     let base = g(&[&["a", "b"], &["c", "d"]]);
     let ours = g(&[&["a", "b"], &["c", "X"]]);
     let theirs = g(&[&["a", "b"], &["c", "Z"]]);
-    report("same-cell conflict", &base, &ours, &theirs);
 
-    let opts = GridOptions::default();
-    let gm = grid_merge(&base, &ours, &theirs, &opts);
-    let (_tg, tc) = tree_path_merge(&base, &ours, &theirs, &opts);
-    assert_eq!(gm.conflicts.len(), 1);
-    assert_eq!(tc, 1, "stable-key tree path should detect the same-cell conflict");
+    let (_tg, tc) = tree_path_merge(&base, &ours, &theirs, &GridOptions::default());
+    assert_eq!(tc, 1, "tree path detects the same-cell conflict");
 }
 
 #[test]
 fn stable_key_row_insert_shift() {
-    // The case that broke probe #1: theirs prepends a row, ours edits the last.
+    // theirs prepends a row; ours edits the last row. Coordinate-descent keying
+    // aligns the shift, so both apply cleanly (this is the case positional keys
+    // could not handle).
     let base = g(&[&["h1", "h2"], &["a", "b"]]);
     let ours = g(&[&["h1", "h2"], &["a", "B"]]);
     let theirs = g(&[&["NEW", "ROW"], &["h1", "h2"], &["a", "b"]]);
-    report("row insert + shift", &base, &ours, &theirs);
 
-    let opts = GridOptions::default();
-    let gm = grid_merge(&base, &ours, &theirs, &opts);
-    let (tg, tc) = tree_path_merge(&base, &ours, &theirs, &opts);
-    // Does stable keying reproduce grid_merge's alignment-aware clean merge?
-    println!("  MATCH: grid={} conflicts={}", gm.grid == tg, gm.conflicts.len() == tc);
-    // Documented expectation — this is the decisive assertion. If it passes,
-    // folding is viable; if it fails, this is the true boundary.
-    assert_eq!(tg, gm.grid, "row-insert: stable-key tree path vs grid_merge");
-    assert_eq!(tc, gm.conflicts.len(), "row-insert: conflict counts");
+    let (tg, tc) = tree_path_merge(&base, &ours, &theirs, &GridOptions::default());
+    assert_eq!(tg, g(&[&["h1", "h2"], &["a", "B"], &["NEW", "ROW"]]),
+        "row insert + edit both applied via alignment keys");
+    assert_eq!(tc, 0);
 }

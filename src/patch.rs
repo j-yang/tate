@@ -58,10 +58,10 @@ use crate::tree::TreeNode;
 
 /// A generic merge result carrying the merged value and conflicts.
 ///
-/// The common shape shared by all three merge implementations:
-/// - Line merge returns [`crate::merge::MergeOutcome`] (conflicts inline).
-/// - Grid merge returns [`crate::grid::GridMergeResult`] (cell-level conflicts).
-/// - Tree merge returns [`crate::tree::TreeMergeResult`] (node-level conflicts).
+/// The shape of a 3-way merge outcome: the best-effort merged value plus the
+/// list of gluing obstructions. [`crate::tree::TreeMergeResult`] is the concrete
+/// instance ([`crate::tree::tree_merge`] is the sole merge — grid and line
+/// inputs reach it by being keyed into trees first).
 pub struct MergeResult<T, C> {
     pub merged: T,
     pub conflicts: Vec<C>,
