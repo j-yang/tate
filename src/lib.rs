@@ -21,9 +21,12 @@
 //!   from a common base, with conflict detection.
 //! - [`grid`] — 2D grid alignment and 3-way grid merge (pushout of grid diffs).
 //! - [`tree`] — structural tree diff and 3-way tree merge.
-//! - [`patch`] — lossless patch algebra over trees: `diff` / `apply` / `invert`
-//!   / `compose`, the morphisms of the versioned-structure category, with laws
-//!   verified by proptest.
+//! - [`section`] — the canonical object: a [`section::Section`] is the flat
+//!   `location → value` form of a tree (the sheaf section the algebra runs on).
+//!   Convert with [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
+//! - [`patch`] — lossless patch algebra over sections: `diff` / `apply` /
+//!   `invert` / `compose`, the morphisms of the versioned-structure category,
+//!   with laws verified by proptest.
 //! - [`change`] — versioned change sets: diff results with metadata (version
 //!   labels, timestamp, author) for audit and cross-language pipelines.
 //!
@@ -64,6 +67,7 @@ pub mod inline;
 pub mod lines;
 pub mod merge;
 pub mod patch;
+pub mod section;
 pub mod tree;
 pub mod unified;
 

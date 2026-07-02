@@ -53,6 +53,7 @@ use std::collections::BTreeMap;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
+use crate::section::{Location, Section, Value};
 use crate::tree::TreeNode;
 
 /// A generic merge result carrying the merged value and conflicts.
@@ -66,31 +67,6 @@ pub struct MergeResult<T, C> {
     pub conflicts: Vec<C>,
 }
 
-/// A location in the tree: the sequence of sibling keys from the root down to a
-/// node. A key is the node's identity if set, otherwise its kind.
-pub type Location = Vec<String>;
-
-/// The value living at one location: everything intrinsic to a node *except*
-/// which children it has (that is encoded by which other locations exist).
-///
-/// Per the sheaf model, structural position (`order` among siblings) is part of
-/// the value, not the location — so moving a node to a new parent is a value
-/// change at a stable location, not a delete+add.
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct NodeValue {
-    pub kind: String,
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
-    pub label: String,
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
-    pub text: String,
-    /// Attributes kept in their original order — reordering is a value change.
-    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
-    pub attrs: Vec<(String, String)>,
-    /// Index among the parent's children (structural position as value).
-    pub order: usize,
-}
-
 /// One point edit: the value at a location goes from `old` to `new`. `None`
 /// means `⊥` (the location is absent on that side). The invariant `old != new`
 /// holds for every edit in a [`Patch`].
@@ -98,9 +74,9 @@ pub struct NodeValue {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct PointEdit {
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub old: Option<NodeValue>,
+    pub old: Option<Value>,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
-    pub new: Option<NodeValue>,
+    pub new: Option<Value>,
 }
 
 /// A lossless patch: a location-keyed map of point edits. Its domain is exactly
@@ -131,9 +107,9 @@ impl Patch {
 pub struct ApplyError {
     pub location: Location,
     /// The value the patch expected to find.
-    pub expected: Option<NodeValue>,
+    pub expected: Option<Value>,
     /// The value actually present.
-    pub found: Option<NodeValue>,
+    pub found: Option<Value>,
 }
 
 impl std::fmt::Display for ApplyError {
@@ -148,130 +124,18 @@ impl std::fmt::Display for ApplyError {
 
 impl std::error::Error for ApplyError {}
 
-// ─── flatten / unflatten: TreeNode ⇄ location→value map ────────────────────────
-
-/// The key locating a node among its siblings: identity if present, else kind.
-fn loc_segment(n: &TreeNode) -> String {
-    match &n.identity {
-        Some(id) => id.clone(),
-        None => n.kind.clone(),
-    }
-}
-
-/// Flatten a tree into its section: a map from every location to its value.
-fn flatten(root: &TreeNode) -> BTreeMap<Location, NodeValue> {
-    let mut map = BTreeMap::new();
-    let mut path = vec![loc_segment(root)];
-    flatten_into(root, 0, &mut path, &mut map);
-    map
-}
-
-fn flatten_into(
-    node: &TreeNode,
-    order: usize,
-    path: &mut Location,
-    map: &mut BTreeMap<Location, NodeValue>,
-) {
-    map.insert(
-        path.clone(),
-        NodeValue {
-            kind: node.kind.clone(),
-            label: node.label.clone(),
-            text: node.text.clone(),
-            attrs: node.attributes.clone(),
-            order,
-        },
-    );
-    for (i, child) in node.children.iter().enumerate() {
-        path.push(loc_segment(child));
-        flatten_into(child, i, path, map);
-        path.pop();
-    }
-}
-
-/// Rebuild a tree from its section. Returns `None` if the map is empty or has no
-/// single root (a location of length 1).
-fn unflatten(map: &BTreeMap<Location, NodeValue>) -> Option<TreeNode> {
-    if map.is_empty() {
-        return None;
-    }
-    // Build a bare node (no children yet) for every location.
-    let mut nodes: BTreeMap<Location, TreeNode> = BTreeMap::new();
-    for (loc, v) in map {
-        nodes.insert(
-            loc.clone(),
-            TreeNode {
-                kind: v.kind.clone(),
-                identity: loc.last().and_then(|seg| {
-                    // Recover identity: a node is identity-keyed iff its key
-                    // differs from its kind (kind-keyed nodes are positional).
-                    if seg != &v.kind { Some(seg.clone()) } else { None }
-                }),
-                label: v.label.clone(),
-                attributes: v.attrs.clone(),
-                text: v.text.clone(),
-                children: Vec::new(),
-            },
-        );
-    }
-    // Attach children to parents, deepest first, so a parent is fully built
-    // before it is itself attached upward. Sort each parent's children by the
-    // stored `order`.
-    let mut locs: Vec<Location> = map.keys().cloned().collect();
-    locs.sort_by_key(|l| std::cmp::Reverse(l.len()));
-    // pending[parent] = list of (order, child_location)
-    let mut pending: BTreeMap<Location, Vec<(usize, Location)>> = BTreeMap::new();
-    for loc in &locs {
-        if loc.len() >= 2 {
-            let parent = loc[..loc.len() - 1].to_vec();
-            let order = map.get(loc).map(|v| v.order).unwrap_or(0);
-            pending.entry(parent).or_default().push((order, loc.clone()));
-        }
-    }
-    // Move children into their parents. Process deepest parents first so that a
-    // subtree is complete before its root is moved up.
-    let mut parent_locs: Vec<Location> = pending.keys().cloned().collect();
-    parent_locs.sort_by_key(|l| std::cmp::Reverse(l.len()));
-    for parent in parent_locs {
-        let mut kids = pending.remove(&parent).unwrap_or_default();
-        kids.sort_by_key(|(order, _)| *order);
-        for (_, child_loc) in kids {
-            if let Some(child) = nodes.remove(&child_loc) {
-                if let Some(p) = nodes.get_mut(&parent) {
-                    p.children.push(child);
-                }
-            }
-        }
-    }
-    // The sole remaining length-1 location is the root.
-    let root_loc = nodes.keys().find(|l| l.len() == 1).cloned()?;
-    nodes.remove(&root_loc)
-}
-
 // ─── diff / apply / invert / compose ───────────────────────────────────────────
 
-/// The unique patch taking section `a` to section `b`.
-///
-/// ```
-/// use tate::tree::TreeNode;
-/// use tate::patch::{diff, apply};
-///
-/// let a = TreeNode::new("root").with_child(TreeNode::new("x").with_identity("1"));
-/// let b = TreeNode::new("root")
-///     .with_child(TreeNode::new("x").with_identity("1"))
-///     .with_child(TreeNode::new("y").with_identity("2"));
-/// assert_eq!(apply(&diff(&a, &b), &a).unwrap(), b);
-/// ```
-pub fn diff(a: &TreeNode, b: &TreeNode) -> Patch {
-    let fa = flatten(a);
-    let fb = flatten(b);
+/// The unique patch taking section `a` to section `b`. This is the core of the
+/// algebra; [`diff`] is the tree-facing wrapper.
+pub fn diff_sections(a: &Section, b: &Section) -> Patch {
     let mut edits = BTreeMap::new();
     // Every location present on either side; record where the value differs.
-    let mut locations: std::collections::BTreeSet<&Location> = fa.keys().collect();
-    locations.extend(fb.keys());
+    let mut locations: std::collections::BTreeSet<&Location> = a.values.keys().collect();
+    locations.extend(b.values.keys());
     for loc in locations {
-        let old = fa.get(loc);
-        let new = fb.get(loc);
+        let old = a.values.get(loc);
+        let new = b.values.get(loc);
         if old != new {
             edits.insert(
                 loc.clone(),
@@ -285,13 +149,13 @@ pub fn diff(a: &TreeNode, b: &TreeNode) -> Patch {
     Patch { edits }
 }
 
-/// Transport section `a` along patch `p`. Fails with [`ApplyError`] if `p`'s
-/// expected `old` value at any location does not match `a` — a patch only
-/// applies to the exact section it was diffed from.
-pub fn apply(p: &Patch, a: &TreeNode) -> Result<TreeNode, Box<ApplyError>> {
-    let mut section = flatten(a);
+/// Transport section `a` along patch `p`, producing the target section. Fails
+/// with [`ApplyError`] if `p`'s expected `old` value at any location does not
+/// match `a` — a patch only applies to the exact section it was diffed from.
+pub fn apply_to_section(p: &Patch, a: &Section) -> Result<Section, Box<ApplyError>> {
+    let mut values = a.values.clone();
     for (loc, edit) in &p.edits {
-        let current = section.get(loc).cloned();
+        let current = values.get(loc).cloned();
         if current != edit.old {
             return Err(Box::new(ApplyError {
                 location: loc.clone(),
@@ -301,16 +165,40 @@ pub fn apply(p: &Patch, a: &TreeNode) -> Result<TreeNode, Box<ApplyError>> {
         }
         match &edit.new {
             Some(v) => {
-                section.insert(loc.clone(), v.clone());
+                values.insert(loc.clone(), v.clone());
             }
             None => {
-                section.remove(loc);
+                values.remove(loc);
             }
         }
     }
+    Ok(Section { values })
+}
+
+/// The unique patch taking tree `a` to tree `b` (flattens both, then diffs).
+///
+/// ```
+/// use tate::tree::TreeNode;
+/// use tate::patch::{diff, apply};
+///
+/// let a = TreeNode::new("root").with_child(TreeNode::new("x").with_identity("1"));
+/// let b = TreeNode::new("root")
+///     .with_child(TreeNode::new("x").with_identity("1"))
+///     .with_child(TreeNode::new("y").with_identity("2"));
+/// assert_eq!(apply(&diff(&a, &b), &a).unwrap(), b);
+/// ```
+pub fn diff(a: &TreeNode, b: &TreeNode) -> Patch {
+    diff_sections(&a.to_section(), &b.to_section())
+}
+
+/// Transport tree `a` along patch `p`. Fails with [`ApplyError`] if `p`'s
+/// expected `old` value at any location does not match `a` — a patch only
+/// applies to the exact tree it was diffed from.
+pub fn apply(p: &Patch, a: &TreeNode) -> Result<TreeNode, Box<ApplyError>> {
+    let result = apply_to_section(p, &a.to_section())?;
     // An empty section can only arise if the whole tree was deleted; callers of
     // apply always keep at least the root, but guard anyway.
-    Ok(unflatten(&section).unwrap_or_else(|| a.clone()))
+    Ok(result.to_tree().unwrap_or_else(|| a.clone()))
 }
 
 /// The inverse morphism: `apply(invert(p), apply(p, a)) == a`.
@@ -384,13 +272,6 @@ mod tests {
                     .with_child(TreeNode::new("item").with_identity("i2").with_attr("v", "2")),
             )
             .with_child(TreeNode::new("group").with_identity("g2").with_text("empty"))
-    }
-
-    #[test]
-    fn flatten_unflatten_roundtrips() {
-        let t = sample();
-        let flat = flatten(&t);
-        assert_eq!(unflatten(&flat), Some(t));
     }
 
     #[test]
