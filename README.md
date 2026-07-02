@@ -6,7 +6,7 @@ A self-contained structured diff library for Rust — line diff, grid alignment,
 
 ## Overview
 
-Tate provides four facilities for diffing structured data, all with zero external diff-engine dependencies:
+Tate provides several facilities for diffing structured data, all with zero external diff-engine dependencies:
 
 - **`lines`** — A production line-diff engine (patience anchors + LCS + Hirschberg linear-space + block-replacement bailout). Produces `Equal | Delete | Insert` ops; feed the result into `inline` to get `Replace` rows with word-level highlights.
 
@@ -14,7 +14,9 @@ Tate provides four facilities for diffing structured data, all with zero externa
 
 - **`grid`** — Aligns two 2D grids of strings (rows × columns) and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs.
 
-- **`tree`** — Structural diff of two `TreeNode`s (a format-agnostic intermediate representation). Callers convert from their format (XML, JSON, YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing dependencies.
+- **`tree`** — Structural diff of two `TreeNode`s (a format-agnostic intermediate representation). Callers convert from their format (XML, JSON, YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing dependencies. Also provides `tree_merge`, a 3-way merge that records every gluing obstruction as a `TreeConflict`.
+
+- **`patch`** — A lossless patch algebra over trees: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure category. A `TreeNode` is a *section* of the location→value sheaf; a patch is a morphism between two sections. The laws (`apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`) are verified by `proptest`.
 
 ## Usage
 

@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 
 /// A format-agnostic tree node. Convert from your format (XML, JSON, …) into
 /// this type, then call [`tree_diff`].
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeNode {
     /// Element type (XML tag name, JSON object key, `"[array]"` for array items).
@@ -344,11 +344,31 @@ pub struct TreeMergeResult {
     pub conflicts: Vec<TreeConflict>,
 }
 
-/// One node-level conflict in a tree merge.
+/// The kind of gluing obstruction that produced a [`TreeConflict`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
+pub enum ConflictKind {
+    /// Both sides set the same attribute on the same node to different values.
+    Attr,
+    /// Both sides added a node at the same path with differing content.
+    AddAdd,
+    /// One side modified a node the other side removed.
+    ModifyDelete,
+}
+
+/// One node-level conflict in a tree merge — a point where the two sections
+/// disagree and cannot be glued. The merged tree still contains a best-effort
+/// value (favouring `ours`); this record flags that the choice was forced.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct TreeConflict {
+    pub kind: ConflictKind,
+    /// Path from root (`kind#identity` segments) locating the conflicting node.
     pub path: Vec<String>,
+    /// Attribute name for [`ConflictKind::Attr`]; empty for node-level conflicts.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
+    pub attr: String,
     pub base: String,
     pub ours: String,
     pub theirs: String,
@@ -356,9 +376,17 @@ pub struct TreeConflict {
 
 /// 3-way merge of two trees that diverged from a common base.
 ///
+/// This is the sheaf gluing of two sections: `ours` and `theirs` each restrict
+/// to `base` on the untouched locus, and the merge glues them back together.
+/// Independent changes to different nodes glue cleanly and auto-merge. Where the
+/// two branches change the *same* location incompatibly the gluing fails; every
+/// such point is recorded as a [`TreeConflict`] (see [`ConflictKind`] for the
+/// three obstruction classes). The merge is a **total function** — it always
+/// returns a tree carrying a best-effort value (favouring `ours`) — but a
+/// non-empty `conflicts` list means that value was forced and needs review.
+///
 /// Uses path-based matching: each change is located by its `kind#identity` path
-/// from the root. Independent changes to different nodes auto-merge; conflicting
-/// attribute changes on the same node are reported.
+/// from the root.
 ///
 /// ```
 /// use tate::tree::{TreeNode, tree_merge};
@@ -377,27 +405,8 @@ pub fn tree_merge(base: &TreeNode, ours: &TreeNode, theirs: &TreeNode) -> TreeMe
     let diff_o = tree_diff(base, ours);
     let diff_t = tree_diff(base, theirs);
 
-    let mut attr_ours: std::collections::HashMap<String, &AttrChange> = std::collections::HashMap::new();
-    for c in &diff_o.changes {
-        if c.kind == ChangeKind::Modified {
-            for a in &c.changed_attrs {
-                let key = format!("{}#{}", path_key(&c.path), a.name);
-                attr_ours.insert(key, a);
-            }
-        }
-    }
-    let mut attr_theirs: std::collections::HashMap<String, &AttrChange> = std::collections::HashMap::new();
-    for c in &diff_t.changes {
-        if c.kind == ChangeKind::Modified {
-            for a in &c.changed_attrs {
-                let key = format!("{}#{}", path_key(&c.path), a.name);
-                attr_theirs.insert(key, a);
-            }
-        }
-    }
-
-    let mut conflicts = Vec::new();
-    let tree = merge_nodes(base, ours, theirs, &diff_o, &diff_t, &attr_ours, &attr_theirs, &mut conflicts);
+    let conflicts = detect_conflicts(base, ours, theirs, &diff_o, &diff_t);
+    let tree = merge_nodes(base, ours, theirs, &diff_o, &diff_t);
 
     TreeMergeResult { tree, conflicts }
 }
@@ -406,15 +415,172 @@ fn path_key(path: &[String]) -> String {
     path.join("/")
 }
 
+/// Find the gluing obstructions between the two branches.
+///
+/// A 3-way merge glues two sections (`ours`, `theirs`) that both restrict to
+/// `base` on the unchanged locus. Where their changes overlap incompatibly the
+/// gluing fails; each such point is a [`TreeConflict`]. The merged tree still
+/// carries a best-effort value (favouring `ours`) — these records make the
+/// forced choice explicit rather than silently dropping `theirs`.
+fn detect_conflicts(
+    base: &TreeNode,
+    ours: &TreeNode,
+    theirs: &TreeNode,
+    diff_o: &TreeDiff,
+    diff_t: &TreeDiff,
+) -> Vec<TreeConflict> {
+    let mut conflicts = Vec::new();
+
+    // Index each side's attribute modifications by path#attr → the change.
+    let attr_index = |diff: &TreeDiff| -> std::collections::HashMap<String, AttrChange> {
+        let mut m = std::collections::HashMap::new();
+        for c in &diff.changes {
+            if c.kind == ChangeKind::Modified {
+                for a in &c.changed_attrs {
+                    m.insert(format!("{}#{}", path_key(&c.path), a.name), a.clone());
+                }
+            }
+        }
+        m
+    };
+    let attr_o = attr_index(diff_o);
+    let attr_t = attr_index(diff_t);
+
+    // (1) attr/attr: both sides set the same attribute to different values.
+    for (key, ao) in &attr_o {
+        if let Some(at) = attr_t.get(key) {
+            if ao.new != at.new {
+                let (path, attr) = split_attr_key(key);
+                conflicts.push(TreeConflict {
+                    kind: ConflictKind::Attr,
+                    path,
+                    attr,
+                    base: ao.old.clone(),
+                    ours: ao.new.clone(),
+                    theirs: at.new.clone(),
+                });
+            }
+        }
+    }
+
+    let paths_of = |diff: &TreeDiff, kind: ChangeKind| -> std::collections::HashSet<String> {
+        diff.changes
+            .iter()
+            .filter(|c| c.kind == kind)
+            .map(|c| path_key(&c.path))
+            .collect()
+    };
+    let added_o = paths_of(diff_o, ChangeKind::Added);
+    let removed_o = paths_of(diff_o, ChangeKind::Removed);
+    let removed_t = paths_of(diff_t, ChangeKind::Removed);
+    let modified_o = paths_of(diff_o, ChangeKind::Modified);
+    let modified_t = paths_of(diff_t, ChangeKind::Modified);
+
+    // (2) add/add: both sides added a node at the same path with differing content.
+    for c in &diff_t.changes {
+        if c.kind != ChangeKind::Added {
+            continue;
+        }
+        let pk = path_key(&c.path);
+        if !added_o.contains(&pk) {
+            continue;
+        }
+        let node_o = find_node_by_path(ours, &c.path);
+        let node_t = find_node_by_path(theirs, &c.path);
+        if node_o != node_t {
+            conflicts.push(TreeConflict {
+                kind: ConflictKind::AddAdd,
+                path: c.path.clone(),
+                attr: String::new(),
+                base: String::new(),
+                ours: node_label(node_o),
+                theirs: node_label(node_t),
+            });
+        }
+    }
+
+    // (3) modify/delete: one side modified a node the other side removed.
+    for pk in modified_o.iter() {
+        if removed_t.contains(pk) {
+            conflicts.push(mk_modify_delete(diff_o, base, pk, /*ours_modified=*/ true));
+        }
+    }
+    for pk in modified_t.iter() {
+        if removed_o.contains(pk) {
+            conflicts.push(mk_modify_delete(diff_t, base, pk, /*ours_modified=*/ false));
+        }
+    }
+
+    conflicts
+}
+
+/// Split a `path#attr` key back into its path segments and attribute name.
+fn split_attr_key(key: &str) -> (Vec<String>, String) {
+    match key.rsplit_once('#') {
+        Some((path, attr)) => (
+            if path.is_empty() { Vec::new() } else { path.split('/').map(String::from).collect() },
+            attr.to_string(),
+        ),
+        None => (Vec::new(), key.to_string()),
+    }
+}
+
+/// A short human label for a node, for conflict reporting.
+fn node_label(n: Option<&TreeNode>) -> String {
+    match n {
+        Some(n) if !n.label.is_empty() => n.label.clone(),
+        Some(n) => node_key(n),
+        None => String::new(),
+    }
+}
+
+/// Build a modify/delete conflict. `ours_modified` records which side made the
+/// modification (the other side removed the node).
+fn mk_modify_delete(mod_diff: &TreeDiff, base: &TreeNode, pk: &str, ours_modified: bool) -> TreeConflict {
+    let path: Vec<String> = if pk.is_empty() {
+        Vec::new()
+    } else {
+        pk.split('/').map(String::from).collect()
+    };
+    let base_label = node_label(find_node_by_path(base, &path));
+    // Describe the modification concisely from the diff record.
+    let mod_desc = mod_diff
+        .changes
+        .iter()
+        .find(|c| c.kind == ChangeKind::Modified && path_key(&c.path) == pk)
+        .map(|c| {
+            if c.changed_attrs.is_empty() {
+                "modified".to_string()
+            } else {
+                c.changed_attrs
+                    .iter()
+                    .map(|a| format!("{}={}", a.name, a.new))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            }
+        })
+        .unwrap_or_else(|| "modified".to_string());
+    let (ours, theirs) = if ours_modified {
+        (mod_desc, "deleted".to_string())
+    } else {
+        ("deleted".to_string(), mod_desc)
+    };
+    TreeConflict {
+        kind: ConflictKind::ModifyDelete,
+        path,
+        attr: String::new(),
+        base: base_label,
+        ours,
+        theirs,
+    }
+}
+
 fn merge_nodes(
     base: &TreeNode,
     ours: &TreeNode,
     theirs: &TreeNode,
     diff_o: &TreeDiff,
     diff_t: &TreeDiff,
-    _attr_ours: &std::collections::HashMap<String, &AttrChange>,
-    _attr_theirs: &std::collections::HashMap<String, &AttrChange>,
-    _conflicts: &mut Vec<TreeConflict>,
 ) -> TreeNode {
     let mut merged = ours.clone();
 
@@ -705,6 +871,126 @@ mod tests {
         let base = TreeNode::new("root")
             .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
         let r = tree_merge(&base, &base, &base);
+        assert_eq!(r.conflicts.len(), 0);
+    }
+
+    // ── conflict detection: gluing obstructions must be recorded, not swallowed ──
+
+    #[test]
+    fn conflicting_attr_change_is_recorded() {
+        // Both sides change the SAME attribute to DIFFERENT values → attr conflict.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "7"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 1, "divergent attr edit must conflict");
+        let c = &r.conflicts[0];
+        assert_eq!(c.kind, ConflictKind::Attr);
+        assert_eq!(c.attr, "v");
+        assert_eq!(c.path, vec!["e#u1"]);
+        assert_eq!((c.base.as_str(), c.ours.as_str(), c.theirs.as_str()), ("1", "9", "7"));
+        // Merged tree still carries a best-effort value (favour ours).
+        assert_eq!(r.tree.children[0].attr("v"), Some("9"));
+    }
+
+    #[test]
+    fn same_attr_same_value_is_not_a_conflict() {
+        // Both sides make the identical edit → no obstruction (glues cleanly).
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+        let side = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
+        let r = tree_merge(&base, &side, &side);
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.tree.children[0].attr("v"), Some("9"));
+    }
+
+    #[test]
+    fn independent_attr_changes_do_not_conflict() {
+        // Different attributes on the same node → both apply, no conflict.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "1").with_attr("b", "2"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "9").with_attr("b", "2"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "1").with_attr("b", "8"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 0);
+    }
+
+    #[test]
+    fn add_add_divergent_is_recorded() {
+        // Both sides add a node at the same path but with different content.
+        let base = TreeNode::new("root");
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "ours"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "theirs"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 1);
+        assert_eq!(r.conflicts[0].kind, ConflictKind::AddAdd);
+        assert_eq!(r.conflicts[0].path, vec!["e#u1"]);
+    }
+
+    #[test]
+    fn add_add_identical_is_not_a_conflict() {
+        // Both sides add the SAME node → glues cleanly.
+        let base = TreeNode::new("root");
+        let node = TreeNode::new("e").with_identity("u1").with_attr("v", "same");
+        let side = TreeNode::new("root").with_child(node);
+        let r = tree_merge(&base, &side, &side);
+        assert_eq!(r.conflicts.len(), 0);
+        assert_eq!(r.tree.children.len(), 1);
+    }
+
+    #[test]
+    fn modify_delete_is_recorded() {
+        // ours modifies u1; theirs deletes u1 → modify/delete conflict.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
+        let theirs = TreeNode::new("root");
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 1);
+        let c = &r.conflicts[0];
+        assert_eq!(c.kind, ConflictKind::ModifyDelete);
+        assert_eq!(c.path, vec!["e#u1"]);
+        assert_eq!(c.theirs, "deleted");
+        assert!(c.ours.contains("v=9"));
+    }
+
+    #[test]
+    fn delete_modify_is_recorded_symmetrically() {
+        // Mirror of the above: theirs modifies, ours deletes.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+        let ours = TreeNode::new("root");
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
+        let r = tree_merge(&base, &ours, &theirs);
+        assert_eq!(r.conflicts.len(), 1);
+        let c = &r.conflicts[0];
+        assert_eq!(c.kind, ConflictKind::ModifyDelete);
+        assert_eq!(c.ours, "deleted");
+        assert!(c.theirs.contains("v=9"));
+    }
+
+    #[test]
+    fn clean_merge_reports_no_conflicts() {
+        // The pre-existing merge_independent_attr_changes scenario must stay clean.
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "1"));
+        let ours = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "1"))
+            .with_child(TreeNode::new("f").with_identity("u2"));
+        let theirs = TreeNode::new("root")
+            .with_child(TreeNode::new("e").with_identity("u1").with_attr("a", "2"));
+        let r = tree_merge(&base, &ours, &theirs);
+        // ours adds u2, theirs modifies u1 — disjoint → no conflict.
         assert_eq!(r.conflicts.len(), 0);
     }
 

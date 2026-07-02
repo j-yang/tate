@@ -21,8 +21,9 @@
 //!   from a common base, with conflict detection.
 //! - [`grid`] — 2D grid alignment and 3-way grid merge (pushout of grid diffs).
 //! - [`tree`] — structural tree diff and 3-way tree merge.
-//! - [`patch`] — unified framework describing diff, merge, and conflict as
-//!   pushout computation in the groupoid of versioned structures.
+//! - [`patch`] — lossless patch algebra over trees: `diff` / `apply` / `invert`
+//!   / `compose`, the morphisms of the versioned-structure category, with laws
+//!   verified by proptest.
 //! - [`change`] — versioned change sets: diff results with metadata (version
 //!   labels, timestamp, author) for audit and cross-language pipelines.
 //!
