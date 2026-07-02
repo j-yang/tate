@@ -1,6 +1,6 @@
 # tate
 
-A self-contained structured diff library for Rust — line diff, grid alignment, tree comparison, and inline word-level highlighting.
+A self-contained structured diff, patch, and merge library for Rust — one tree algebra (diff / 3-way merge / lossless patch) plus keying adapters (line diff, grid alignment) and inline word-level highlighting.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -12,11 +12,13 @@ Tate provides several facilities for diffing structured data, all with zero exte
 
 - **`inline`** — Pairs delete+insert blocks into `Replace` ops carrying word-level inline segments. A line that turned `foo bar` into `foo baz` becomes one row highlighting only `baz`, not a noisy delete+insert pair.
 
-- **`grid`** — Aligns two 2D grids of strings (rows × columns) and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs.
+- **`grid`** — Aligns two 2D grids of strings (rows × columns) via row/column coordinate descent and emits one aligned grid with per-cell status (`equal` / `modified` / `added` / `removed`). Works against arbitrary `&[Vec<String>]` inputs. Doubles as a keying adapter: the alignment it computes gives an un-keyed grid stable identities so it can be merged as a tree.
 
-- **`tree`** — Structural diff of two `TreeNode`s (a format-agnostic intermediate representation). Callers convert from their format (XML, JSON, YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing dependencies. Also provides `tree_merge`, a 3-way merge that records every gluing obstruction as a `TreeConflict`.
+- **`tree`** — Structural diff of two `TreeNode`s (a format-agnostic intermediate representation). Callers convert from their format (XML, JSON, YAML, …) into `TreeNode` before calling `tree_diff`. Zero format-parsing dependencies. Also provides `tree_merge` — tate's **single** 3-way merge — which records every gluing obstruction (attribute, text, add/add, modify/delete) as a `TreeConflict`.
 
-- **`patch`** — A lossless patch algebra over trees: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure category. A `TreeNode` is a *section* of the location→value sheaf; a patch is a morphism between two sections. The laws (`apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`) are verified by `proptest`.
+- **`section`** — The canonical object: a `Section` is the flat `location → value` form of a tree (the sheaf section the algebra runs on). Convert with `TreeNode::to_section` / `Section::to_tree`. Identity is the location; structural position (`order`) and scalar content are values, so moves and renames are value changes, not delete+add.
+
+- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure category. Unlike `tree_diff` (a lossy display diff), it round-trips. The laws (`apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, and associativity) are verified by `proptest`.
 
 ## Usage
 
