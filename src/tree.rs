@@ -405,17 +405,22 @@ pub struct TreeConflict {
 
 /// 3-way merge of two trees that diverged from a common base.
 ///
-/// This is the sheaf gluing of two sections: `ours` and `theirs` each restrict
-/// to `base` on the untouched locus, and the merge glues them back together.
-/// Independent changes to different nodes glue cleanly and auto-merge. Where the
-/// two branches change the *same* location incompatibly the gluing fails; every
-/// such point is recorded as a [`TreeConflict`] (see [`ConflictKind`] for the
-/// three obstruction classes). The merge is a **total function** — it always
-/// returns a tree carrying a best-effort value (favouring `ours`) — but a
-/// non-empty `conflicts` list means that value was forced and needs review.
+/// This is the **pushout** of two branch patches in the category of sections.
+/// `ours` and `theirs` each restrict to `base` on the unchanged locus; when
+/// their change sets are disjoint, the pushout exists and the merge glues
+/// cleanly (independent changes auto-merge). Where both branches change the
+/// *same* location incompatibly the pushout does not exist — the obstruction
+/// is recorded as a [`TreeConflict`].
 ///
-/// Uses path-based matching: each change is located by its `kind#identity` path
-/// from the root.
+/// The conflict set is the **first Čech cohomology** H¹ of the cover
+/// {U_ours, U_theirs}, where U_x = locations changed by branch x. Each
+/// conflicting location contributes one generator to H¹.
+///
+/// The merge is a **total function** — it always returns a tree carrying a
+/// best-effort value (favouring `ours`). A non-empty `conflicts` list means
+/// that value was forced and needs review.
+///
+/// See `MATHEMATICS.md` §3 and §5 for details.
 ///
 /// ```
 /// use tate::tree::{TreeNode, tree_merge};

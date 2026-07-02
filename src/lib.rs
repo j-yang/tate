@@ -20,18 +20,14 @@
 //!   gluing obstruction (attribute, text, add/add, modify/delete) as a
 //!   [`tree::TreeConflict`].
 //! - [`patch`] — the lossless patch algebra over sections: `diff` / `apply` /
-//!   `invert` / `compose`, the morphisms of the versioned-structure category.
+//!   `invert` / `compose`, the morphisms of the versioned-structure groupoid.
 //!   Unlike [`tree::tree_diff`] (a lossy display diff) it round-trips; its laws
 //!   are verified by proptest.
 //! - [`change`] — versioned change sets: a tree diff or patch tagged with
 //!   metadata (version labels, timestamp, author) for audit and cross-language
 //!   pipelines.
-//! - [`json`] *(feature `json`)* — a `serde_json::Value` → [`tree::TreeNode`]
-//!   on-ramp, so any JSON-representable data (JSON/YAML/TOML/…, or any
-//!   `#[derive(Serialize)]` value via `serde_json::to_value`) can be
-//!   diffed/merged/patched with no format-parsing crate.
 //!
-//! Diff a JSON-like tree:
+//! Diff two trees:
 //! ```
 //! use tate::tree::{TreeNode, tree_diff, ChangeKind};
 //!
@@ -66,8 +62,6 @@
 //! ```
 
 pub mod change;
-#[cfg(feature = "json")]
-pub mod json;
 pub mod patch;
 pub mod section;
 pub mod tree;

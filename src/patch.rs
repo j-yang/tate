@@ -1,10 +1,11 @@
-//! Patch algebra: the morphisms of the versioned-structure category.
+//! Patch algebra: the morphisms of the versioned-structure groupoid.
 //!
-//! A [`TreeNode`](crate::tree::TreeNode) is a *section* of the location→value
+//! A [`TreeNode`](crate::tree) is a *section* of the location→value
 //! sheaf: an assignment of a value to every location in the tree. A **patch**
 //! is a morphism between two sections — it records, for each location that
 //! changed, the old and new value (with `None` standing for `⊥`, the *absent*
-//! location). Three operations make this a category with inverses:
+//! location). Four operations give patches the structure of a **groupoid**
+//! (a category in which every morphism is invertible):
 //!
 //! - [`diff`]`(a, b)` — the unique patch taking section `a` to section `b`.
 //! - [`apply`]`(p, a)` — transport a section along a patch.

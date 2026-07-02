@@ -2,7 +2,7 @@
 //!
 //! tate has two views of the same data:
 //!
-//! - [`TreeNode`](crate::tree::TreeNode) — the **nested** view. Parsers produce
+//! - [`TreeNode`](crate::tree) — the **nested** view. Parsers produce
 //!   it, UIs consume it, humans read it.
 //! - [`Section`] — the **flat** view: a map from every [`Location`] to the
 //!   [`Value`] living there. This is the object the diff/patch/merge algebra is
