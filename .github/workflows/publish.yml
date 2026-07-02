@@ -31,4 +31,8 @@ jobs:
         run: cargo test --all-features
 
       - name: Publish to crates.io
-        run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
+        # --allow-dirty: cargo test / index refresh can touch the tracked
+        # Cargo.lock in CI's throwaway checkout; that dirtiness is harmless.
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --allow-dirty
