@@ -1,6 +1,6 @@
 [package]
 name = "tate"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 license = "MIT"
 description = "A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a location→value sheaf), one 3-way merge, and a lossless patch algebra with proptest-verified laws"
@@ -11,9 +11,14 @@ categories = ["text-processing", "development-tools"]
 
 [features]
 default = ["serde"]
+# `json` adds a serde_json::Value → TreeNode entry point, so any
+# JSON-representable data (JSON/YAML/TOML/…) can be diffed/merged/patched
+# without a separate format crate. Implies `serde`.
+json = ["serde", "dep:serde_json"]
 
 [dependencies]
 serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 # roxmltree is NOT a tate dependency — format parsing happens in mumford.
 
 [dev-dependencies]

@@ -16,13 +16,15 @@ Tate is built on one commitment: **every structure is a tree**, and a tree is a 
 
 - **`change`** — A `ChangeSet`: a tree diff or patch tagged with version metadata (labels, timestamp, author) for audit and cross-language pipelines.
 
-> **Format parsing and alignment live elsewhere.** Turning bytes (Excel, PDF, Word, text) into a tree — including the LCS and coordinate-descent alignment that give un-keyed sequence/grid data stable identities — is the job of the [`mumford`](https://github.com/j-yang/mumford) crate. tate is the pure algebra underneath.
+- **`json`** *(feature `json`)* — A `serde_json::Value → TreeNode` on-ramp: any JSON-representable data (JSON, YAML, TOML, …, or any `#[derive(Serialize)]` value via `serde_json::to_value`) becomes a tree you can diff/merge/patch, with no format-parsing crate. Object keys become identities (so key reordering is not a change; scalar edits are pinpointed).
+
+> **Byte parsing and alignment live elsewhere.** Turning *files* (Excel, PDF, Word, plain text) into a tree — including the LCS and coordinate-descent alignment that give un-keyed sequence/grid data stable identities — is the job of the [`mumford`](https://github.com/j-yang/mumford) crate. tate itself is the pure algebra, with the `json` feature as its one built-in, dependency-light on-ramp.
 
 ## Usage
 
 ```toml
 [dependencies]
-tate = "0.4"
+tate = { version = "0.6", features = ["json"] }
 ```
 
 ### Tree diff (format-agnostic)
@@ -38,6 +40,20 @@ let b = TreeNode::new("root")
 let diff = tree_diff(&a, &b);
 assert_eq!(diff.changes.len(), 1);
 assert_eq!(diff.changes[0].kind, ChangeKind::Modified);
+```
+
+### JSON on-ramp (feature `json`)
+
+```rust
+use tate::json::from_json_value;
+use tate::tree::tree_diff;
+use serde_json::json;
+
+let a = from_json_value("root", &json!({"server": {"port": 8080}}));
+let b = from_json_value("root", &json!({"server": {"port": 9090}}));
+
+let diff = tree_diff(&a, &b);
+assert_eq!(diff.changes[0].id, "port");   // the exact key that changed
 ```
 
 ### 3-way merge (the single merge)

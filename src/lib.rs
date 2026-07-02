@@ -26,6 +26,10 @@
 //! - [`change`] — versioned change sets: a tree diff or patch tagged with
 //!   metadata (version labels, timestamp, author) for audit and cross-language
 //!   pipelines.
+//! - [`json`] *(feature `json`)* — a `serde_json::Value` → [`tree::TreeNode`]
+//!   on-ramp, so any JSON-representable data (JSON/YAML/TOML/…, or any
+//!   `#[derive(Serialize)]` value via `serde_json::to_value`) can be
+//!   diffed/merged/patched with no format-parsing crate.
 //!
 //! Diff a JSON-like tree:
 //! ```
@@ -62,6 +66,8 @@
 //! ```
 
 pub mod change;
+#[cfg(feature = "json")]
+pub mod json;
 pub mod patch;
 pub mod section;
 pub mod tree;
