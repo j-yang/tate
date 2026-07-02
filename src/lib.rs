@@ -1,58 +1,55 @@
-//! Tate: a self-contained structured diff library for Rust.
+//! Tate: a pure structured diff, patch, and merge algebra for Rust.
 //!
-//! Six facilities for diffing structured data, all with zero external
-//! diff-engine dependencies:
+//! tate rests on one commitment: **every structure is a tree**, and a tree is a
+//! *section* of a `location → value` sheaf — the flat map from each addressable
+//! location to the value living there. Diff, 3-way merge, and a lossless patch
+//! algebra are defined **once**, on that single object. There is no per-format
+//! machinery here: turning bytes (XML, JSON, spreadsheets, text) into a tree —
+//! and, for un-keyed data, computing the alignment that gives it stable
+//! identities — lives in a separate layer (the `mumford` crate). tate has zero
+//! format-parsing and zero diff-engine dependencies (only optional `serde`).
 //!
-//! - [`lines`] — a production line-diff engine (patience anchors + LCS +
-//!   Hirschberg linear-space + block-replacement bailout). Accepts any
-//!   `&[impl AsRef<str>]`.
-//! - [`inline`] — pairs delete+insert blocks into `Replace` ops carrying
-//!   word-level inline segments. Also provides [`inline::stats`] for diff
-//!   statistics.
-//! - [`grid`] — aligns two 2D grids of strings (rows × columns) and emits one
-//!   aligned grid with per-cell status. Works against arbitrary
-//!   `&[Vec<String>]` (Excel, CSV, HTML tables, SQL result sets, …).
-//! - [`tree`] — structural diff of two [`tree::TreeNode`]s (a format-agnostic
-//!   intermediate representation). Callers convert from their format (XML, JSON,
-//!   YAML, …) into `TreeNode` before calling `tree_diff`.
-//! - [`unified`] — render an edit script as unified diff text (`git diff`
-//!   style) with hunks and context lines.
-//! - [`grid`] — 2D grid alignment (row/column coordinate descent). Produces the
-//!   [`grid::GridDiff`] display result; also serves as a keying adapter that
-//!   turns an un-keyed grid into a stably-keyed tree for the merge algebra.
-//! - [`tree`] — structural tree diff and 3-way tree merge (the sole merge).
 //! - [`section`] — the canonical object: a [`section::Section`] is the flat
-//!   `location → value` form of a tree (the sheaf section the algebra runs on).
-//!   Convert with [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
-//! - [`patch`] — lossless patch algebra over sections: `diff` / `apply` /
-//!   `invert` / `compose`, the morphisms of the versioned-structure category,
-//!   with laws verified by proptest.
-//! - [`change`] — versioned change sets: diff results with metadata (version
-//!   labels, timestamp, author) for audit and cross-language pipelines.
+//!   `location → value` form of a tree. Identity is the location; structural
+//!   position (`order`) and scalar content are values, so a moved or renamed
+//!   node is a value change, not a delete+add. Convert with
+//!   [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
+//! - [`tree`] — the nested [`tree::TreeNode`] view, its structural
+//!   [`tree::tree_diff`], and [`tree::tree_merge`] — the single 3-way merge.
+//!   Merge is total: it always returns a best-effort tree and records every
+//!   gluing obstruction (attribute, text, add/add, modify/delete) as a
+//!   [`tree::TreeConflict`].
+//! - [`patch`] — the lossless patch algebra over sections: `diff` / `apply` /
+//!   `invert` / `compose`, the morphisms of the versioned-structure category.
+//!   Unlike [`tree::tree_diff`] (a lossy display diff) it round-trips; its laws
+//!   are verified by proptest.
+//! - [`change`] — versioned change sets: a tree diff or patch tagged with
+//!   metadata (version labels, timestamp, author) for audit and cross-language
+//!   pipelines.
 //!
-//! Typical pipeline for text file diff:
+//! Diff a JSON-like tree:
 //! ```
-//! use tate::lines::diff;
-//! use tate::inline::{pair_replacements, OpType, DEFAULT_SIMILARITY};
+//! use tate::tree::{TreeNode, tree_diff, ChangeKind};
 //!
-//! let a: Vec<String> = vec!["hello world".into(), "foo bar".into()];
-//! let b: Vec<String> = vec!["hello world".into(), "foo baz".into()];
-//! let ops = diff(&a, &b);
-//! let paired = pair_replacements(ops, DEFAULT_SIMILARITY);
-//! assert_eq!(paired[1].typ, OpType::Replace);
-//! ```
-//!
-//! Unified diff output:
-//! ```
-//! use tate::lines::diff;
-//! use tate::unified::to_unified;
-//!
-//! let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
-//! let text = to_unified(&ops, 3);
-//! assert!(text.contains("@@"));
+//! let a = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
+//! let b = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "2"));
+//! let d = tree_diff(&a, &b);
+//! assert_eq!(d.changes[0].kind, ChangeKind::Modified);
 //! ```
 //!
-//! 3-way merge (the single merge, over trees):
+//! Lossless patch round-trip:
+//! ```
+//! use tate::tree::TreeNode;
+//! use tate::patch::{diff, apply};
+//!
+//! let a = TreeNode::new("root").with_child(TreeNode::new("x").with_identity("1"));
+//! let b = TreeNode::new("root")
+//!     .with_child(TreeNode::new("x").with_identity("1"))
+//!     .with_child(TreeNode::new("y").with_identity("2"));
+//! assert_eq!(apply(&diff(&a, &b), &a).unwrap(), b);
+//! ```
+//!
+//! 3-way merge (the single merge):
 //! ```
 //! use tate::tree::{TreeNode, tree_merge};
 //!
@@ -65,12 +62,6 @@
 //! ```
 
 pub mod change;
-pub mod grid;
-pub mod inline;
-pub mod lines;
 pub mod patch;
 pub mod section;
 pub mod tree;
-pub mod unified;
-
-mod lcs;

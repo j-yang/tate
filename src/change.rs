@@ -1,82 +1,108 @@
-//! Versioned change sets — diff results with metadata for audit and tracking.
+//! Versioned change sets — a tree diff or patch with metadata for audit and tracking.
 //!
-//! A [`ChangeSet`] wraps a tate diff result with version metadata (source
-//! hashes, timestamp, author, note). It is a plain data structure — no I/O,
-//! no history management, no state. Callers are responsible for storing
-//! snapshots and managing version history; tate only answers "what changed
-//! between these two inputs?"
+//! A [`ChangeSet`] wraps a tate result with version metadata (source labels or
+//! hashes, timestamp, author, note). It is a plain data structure — no I/O, no
+//! history management, no state. Callers are responsible for storing snapshots
+//! and managing version history; tate only answers "what changed between these
+//! two inputs?"
 //!
 //! With the `serde` feature, `ChangeSet` serializes to JSON, making it suitable
 //! for cross-language pipelines (Python, R, CLI tools).
 //!
 //! ```
 //! use tate::change::ChangeSet;
-//! use tate::lines::diff;
+//! use tate::tree::{tree_diff, TreeNode};
 //!
-//! let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
-//! let cs = ChangeSet::new_lines(ops, "v1", "v2");
-//! assert_eq!(cs.stats.additions + cs.stats.deletions, 2);
+//! let a = TreeNode::new("root").with_attr("version", "1");
+//! let b = TreeNode::new("root").with_attr("version", "2");
+//! let cs = ChangeSet::new_tree(tree_diff(&a, &b), "v1", "v2");
+//! assert_eq!(cs.stats.modified, 1);
 //! assert_eq!(cs.from_version, "v1");
 //! ```
 
-use crate::grid::GridDiff;
-use crate::inline::{Op, Stats, stats};
-use crate::tree::TreeDiff;
+use crate::patch::Patch;
+use crate::tree::{ChangeKind as TreeChangeKind, TreeDiff};
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
-/// Which tate algorithm produced this change set.
+/// Summary statistics for a change set.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct Stats {
+    pub additions: usize,
+    pub deletions: usize,
+    pub modified: usize,
+    pub unchanged: usize,
+}
+
+impl Stats {
+    /// `true` when the diff contains no changes.
+    pub fn is_clean(&self) -> bool {
+        self.additions + self.deletions + self.modified == 0
+    }
+}
+
+/// Which tate result produced this change set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "lowercase"))]
 pub enum ChangeKind {
-    Line,
-    Grid,
+    /// A structural tree diff (display-oriented).
     Tree,
+    /// A lossless patch (round-trippable).
+    Patch,
 }
 
-/// The diff payload — one variant per tate algorithm family.
+/// The payload — either a display tree diff or a lossless patch.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub enum ChangeOps {
-    Lines(Vec<Op>),
-    Grid(GridDiff),
     Tree(TreeDiff),
+    Patch(Patch),
 }
 
 impl ChangeOps {
     pub fn kind(&self) -> ChangeKind {
         match self {
-            ChangeOps::Lines(_) => ChangeKind::Line,
-            ChangeOps::Grid(_) => ChangeKind::Grid,
             ChangeOps::Tree(_) => ChangeKind::Tree,
+            ChangeOps::Patch(_) => ChangeKind::Patch,
         }
     }
 
     pub fn stats(&self) -> Stats {
         match self {
-            ChangeOps::Lines(ops) => stats(ops),
-            ChangeOps::Grid(gd) => Stats {
-                additions: gd.added_rows,
-                deletions: gd.removed_rows,
-                modified: gd.modified_rows,
-                unchanged: gd.rows.iter().filter(|r| r.status == crate::grid::Status::Equal).count(),
-            },
-            ChangeOps::Tree(td) => {
-                use crate::tree::ChangeKind;
-                let mut s = Stats::default();
-                for c in &td.changes {
-                    match c.kind {
-                        ChangeKind::Added => s.additions += 1,
-                        ChangeKind::Removed => s.deletions += 1,
-                        ChangeKind::Modified => s.modified += 1,
-                    }
-                }
-                s
-            }
+            ChangeOps::Tree(td) => tree_stats(td),
+            ChangeOps::Patch(p) => patch_stats(p),
         }
     }
+}
+
+/// Count added/removed/modified nodes in a tree diff.
+fn tree_stats(td: &TreeDiff) -> Stats {
+    let mut s = Stats::default();
+    for c in &td.changes {
+        match c.kind {
+            TreeChangeKind::Added => s.additions += 1,
+            TreeChangeKind::Removed => s.deletions += 1,
+            TreeChangeKind::Modified => s.modified += 1,
+        }
+    }
+    s
+}
+
+/// Count point edits in a patch by whether they add (⊥→v), remove (v→⊥), or
+/// modify (v→w) a location's value.
+fn patch_stats(p: &Patch) -> Stats {
+    let mut s = Stats::default();
+    for edit in p.edits.values() {
+        match (&edit.old, &edit.new) {
+            (None, Some(_)) => s.additions += 1,
+            (Some(_), None) => s.deletions += 1,
+            _ => s.modified += 1,
+        }
+    }
+    s
 }
 
 /// A versioned diff result with metadata for audit and tracking.
@@ -86,9 +112,9 @@ impl ChangeOps {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct ChangeSet {
-    /// Which algorithm produced the diff payload.
+    /// Which kind of result the payload holds.
     pub kind: ChangeKind,
-    /// The diff result itself.
+    /// The diff or patch itself.
     pub ops: ChangeOps,
     /// Summary statistics derived from `ops`.
     pub stats: Stats,
@@ -107,43 +133,28 @@ pub struct ChangeSet {
 }
 
 impl ChangeSet {
-    /// Create a `ChangeSet` from a line-sequence diff.
-    pub fn new_lines(ops: Vec<Op>, from: impl Into<String>, to: impl Into<String>) -> Self {
-        let stats = stats(&ops);
-        ChangeSet {
-            kind: ChangeKind::Line,
-            stats,
-            ops: ChangeOps::Lines(ops),
-            from_version: from.into(),
-            to_version: to.into(),
-            timestamp: now_unix(),
-            author: None,
-            note: None,
-        }
-    }
-
-    /// Create a `ChangeSet` from a grid (2D table) diff.
-    pub fn new_grid(diff: GridDiff, from: impl Into<String>, to: impl Into<String>) -> Self {
-        let stats = ChangeOps::Grid(diff.clone()).stats();
-        ChangeSet {
-            kind: ChangeKind::Grid,
-            stats,
-            ops: ChangeOps::Grid(diff),
-            from_version: from.into(),
-            to_version: to.into(),
-            timestamp: now_unix(),
-            author: None,
-            note: None,
-        }
-    }
-
-    /// Create a `ChangeSet` from a tree (structural) diff.
+    /// Create a `ChangeSet` from a structural tree diff.
     pub fn new_tree(diff: TreeDiff, from: impl Into<String>, to: impl Into<String>) -> Self {
-        let stats = ChangeOps::Tree(diff.clone()).stats();
+        let stats = tree_stats(&diff);
         ChangeSet {
             kind: ChangeKind::Tree,
             stats,
             ops: ChangeOps::Tree(diff),
+            from_version: from.into(),
+            to_version: to.into(),
+            timestamp: now_unix(),
+            author: None,
+            note: None,
+        }
+    }
+
+    /// Create a `ChangeSet` from a lossless patch.
+    pub fn new_patch(patch: Patch, from: impl Into<String>, to: impl Into<String>) -> Self {
+        let stats = patch_stats(&patch);
+        ChangeSet {
+            kind: ChangeKind::Patch,
+            stats,
+            ops: ChangeOps::Patch(patch),
             from_version: from.into(),
             to_version: to.into(),
             timestamp: now_unix(),
@@ -168,85 +179,60 @@ fn now_unix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lines::diff;
-    use crate::inline::pair_replacements;
-
-    #[test]
-    fn line_changeset_basic() {
-        let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
-        let cs = ChangeSet::new_lines(ops, "v1", "v2");
-        assert_eq!(cs.kind, ChangeKind::Line);
-        assert_eq!(cs.from_version, "v1");
-        assert_eq!(cs.to_version, "v2");
-        assert!(!cs.is_clean());
-        assert_eq!(cs.stats.deletions, 1);
-        assert_eq!(cs.stats.additions, 1);
-    }
-
-    #[test]
-    fn line_changeset_clean() {
-        let ops = diff(&["a", "b"], &["a", "b"]);
-        let cs = ChangeSet::new_lines(ops, "abc123", "def456");
-        assert!(cs.is_clean());
-        assert_eq!(cs.stats.unchanged, 2);
-    }
-
-    #[test]
-    fn line_changeset_with_replace() {
-        let ops = pair_replacements(diff(&["foo bar"], &["foo baz"]), 0.5);
-        let cs = ChangeSet::new_lines(ops, "r1", "r2");
-        assert_eq!(cs.stats.modified, 1);
-        assert!(!cs.is_clean());
-    }
-
-    #[test]
-    fn grid_changeset_basic() {
-        use crate::grid::{grid_diff, GridOptions};
-        let a = vec![vec!["A".into(), "1".into()], vec!["B".into(), "2".into()]];
-        let b = vec![vec!["A".into(), "1".into()], vec!["B".into(), "3".into()]];
-        let gd = grid_diff(&a, &b, &GridOptions::default());
-        let cs = ChangeSet::new_grid(gd, "sheet-v1", "sheet-v2");
-        assert_eq!(cs.kind, ChangeKind::Grid);
-        assert_eq!(cs.from_version, "sheet-v1");
-        assert!(!cs.is_clean());
-        assert_eq!(cs.stats.modified, 1);
-    }
+    use crate::patch::diff as patch_diff;
+    use crate::tree::{tree_diff, TreeNode};
 
     #[test]
     fn tree_changeset_basic() {
-        use crate::tree::{tree_diff, TreeNode};
         let a = TreeNode::new("root").with_attr("version", "1");
         let b = TreeNode::new("root").with_attr("version", "2");
-        let td = tree_diff(&a, &b);
-        let cs = ChangeSet::new_tree(td, "config-v1", "config-v2");
+        let cs = ChangeSet::new_tree(tree_diff(&a, &b), "config-v1", "config-v2");
         assert_eq!(cs.kind, ChangeKind::Tree);
+        assert_eq!(cs.from_version, "config-v1");
         assert!(!cs.is_clean());
         assert_eq!(cs.stats.modified, 1);
+    }
+
+    #[test]
+    fn tree_changeset_clean() {
+        let a = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1"));
+        let cs = ChangeSet::new_tree(tree_diff(&a, &a), "v1", "v1");
+        assert!(cs.is_clean());
+    }
+
+    #[test]
+    fn patch_changeset_counts_add_remove_modify() {
+        let base = TreeNode::new("root")
+            .with_child(TreeNode::new("a").with_identity("u1").with_attr("v", "1"))
+            .with_child(TreeNode::new("b").with_identity("u2"));
+        let target = TreeNode::new("root")
+            .with_child(TreeNode::new("a").with_identity("u1").with_attr("v", "9")) // modify
+            .with_child(TreeNode::new("c").with_identity("u3")); // u2 removed, u3 added
+        let p = patch_diff(&base, &target);
+        let cs = ChangeSet::new_patch(p, "v1", "v2");
+        assert_eq!(cs.kind, ChangeKind::Patch);
+        assert!(!cs.is_clean());
+        assert!(cs.stats.additions >= 1 && cs.stats.deletions >= 1 && cs.stats.modified >= 1);
     }
 
     #[test]
     fn changeset_ops_kind_matches() {
-        let line_cs = ChangeSet::new_lines(vec![], "a", "b");
-        assert_eq!(line_cs.ops.kind(), ChangeKind::Line);
-
-        let grid_cs = ChangeSet::new_grid(GridDiff::default(), "a", "b");
-        assert_eq!(grid_cs.ops.kind(), ChangeKind::Grid);
-
         let tree_cs = ChangeSet::new_tree(TreeDiff::default(), "a", "b");
         assert_eq!(tree_cs.ops.kind(), ChangeKind::Tree);
+        let patch_cs = ChangeSet::new_patch(Patch::empty(), "a", "b");
+        assert_eq!(patch_cs.ops.kind(), ChangeKind::Patch);
     }
 
     #[cfg(feature = "serde")]
     #[test]
-    fn line_changeset_serde_roundtrip() {
-        let ops = diff(&["a", "b", "c"], &["a", "x", "c"]);
-        let cs = ChangeSet::new_lines(ops, "v1", "v2");
+    fn tree_changeset_serde_roundtrip() {
+        let a = TreeNode::new("root").with_attr("version", "1");
+        let b = TreeNode::new("root").with_attr("version", "2");
+        let cs = ChangeSet::new_tree(tree_diff(&a, &b), "v1", "v2");
         let json = serde_json::to_string(&cs).unwrap();
         let back: ChangeSet = serde_json::from_str(&json).unwrap();
         assert_eq!(back.from_version, "v1");
-        assert_eq!(back.to_version, "v2");
-        assert_eq!(back.kind, ChangeKind::Line);
-        assert_eq!(back.stats.additions, 1);
-        assert_eq!(back.stats.deletions, 1);
+        assert_eq!(back.kind, ChangeKind::Tree);
+        assert_eq!(back.stats.modified, 1);
     }
 }

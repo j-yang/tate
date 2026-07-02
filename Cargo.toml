@@ -1,12 +1,12 @@
 [package]
 name = "tate"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 license = "MIT"
-description = "A self-contained structured diff library for Rust — line diff, grid alignment, tree comparison, unified diff output, 3-way merge, and inline word-level highlighting"
+description = "A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a location→value sheaf), one 3-way merge, and a lossless patch algebra with proptest-verified laws"
 repository = "https://github.com/j-yang/tate"
 readme = "README.md"
-keywords = ["diff", "compare", "alignment", "lcs", "merge"]
+keywords = ["diff", "merge", "patch", "tree", "sheaf"]
 categories = ["text-processing", "development-tools"]
 
 [features]
