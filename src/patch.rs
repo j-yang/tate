@@ -68,6 +68,25 @@ pub struct MergeResult<T, C> {
     pub conflicts: Vec<C>,
 }
 
+/// One obstruction to the section pushout: a location where `ours` and `theirs`
+/// both moved away from `base`, to *different* values. There the pushout does
+/// not exist. `merge_sections` still returns a best-effort value (favouring
+/// `ours`) at this location and records the disagreement here.
+///
+/// Values are `Option<Value>` because either side may have deleted the location
+/// (`None` = `⊥`, the absent value).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct SectionConflict {
+    pub location: Location,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub base: Option<Value>,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub ours: Option<Value>,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub theirs: Option<Value>,
+}
+
 /// One point edit: the value at a location goes from `old` to `new`. `None`
 /// means `⊥` (the location is absent on that side). The invariant `old != new`
 /// holds for every edit in a [`Patch`].
@@ -258,6 +277,90 @@ pub fn compose(p: &Patch, q: &Patch) -> Patch {
     Patch { edits }
 }
 
+// ─── merge: the section pushout ────────────────────────────────────────────────
+
+/// 3-way merge as the **pushout** of two branch patches in the category of
+/// sections.
+///
+/// Given the span `ours ← base → theirs` (legs `f = diff(base, ours)` and
+/// `g = diff(base, theirs)`), the pushout is computed **point-wise** on the
+/// discrete location space — the correct way to compute a pushout in a product
+/// category, one factor per location. At each location `ℓ`, with
+/// `b = base(ℓ)`, `o = ours(ℓ)`, `t = theirs(ℓ)` (each an `Option<Value>`,
+/// `None` = `⊥`):
+///
+/// - `o == b` → theirs won the point (only `theirs` moved): take `t`.
+/// - `t == b` → ours won the point (only `ours` moved, or neither): take `o`.
+/// - `o == t` → both made the *same* move: take it (the pushout glues).
+/// - otherwise → both moved to different values: the pushout does **not**
+///   exist at `ℓ`. Record a [`SectionConflict`] and keep `o` (favour ours).
+///
+/// This is a **total function**: it always returns a merged section. An empty
+/// conflict list means the pushout existed globally (a clean merge); a non-empty
+/// one is exactly the obstruction set — the first Čech cohomology H¹ of the
+/// cover {U_ours, U_theirs} where `U_x` is the set of locations `x` changed.
+///
+/// Unlike [`crate::tree::tree_merge`] (which drives a display-oriented merge off
+/// the lossy [`crate::tree::tree_diff`]), this operates on the lossless section
+/// algebra and *is* the pushout the math describes.
+///
+/// ```
+/// use tate::tree::TreeNode;
+/// use tate::patch::merge_sections;
+///
+/// let base = TreeNode::new("r").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1")).to_section();
+/// // ours changes v; theirs is untouched → theirs' point equals base → take ours.
+/// let ours = TreeNode::new("r").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9")).to_section();
+/// let theirs = base.clone();
+/// let r = merge_sections(&base, &ours, &theirs);
+/// assert!(r.conflicts.is_empty());
+/// assert_eq!(r.merged, ours);
+/// ```
+pub fn merge_sections(base: &Section, ours: &Section, theirs: &Section) -> MergeResult<Section, SectionConflict> {
+    let mut merged = BTreeMap::new();
+    let mut conflicts = Vec::new();
+
+    // Every location present in any of the three sections.
+    let mut locations: std::collections::BTreeSet<&Location> = base.values.keys().collect();
+    locations.extend(ours.values.keys());
+    locations.extend(theirs.values.keys());
+
+    for loc in locations {
+        let b = base.values.get(loc);
+        let o = ours.values.get(loc);
+        let t = theirs.values.get(loc);
+
+        // Point-wise pushout. `chosen` is the value the merged section carries at
+        // `loc` (None = the location is absent in the merge).
+        let chosen: Option<&Value> = if o == b {
+            // Only theirs (possibly) moved this point.
+            t
+        } else if t == b {
+            // Only ours moved this point.
+            o
+        } else if o == t {
+            // Both made the identical move — the pushout glues cleanly.
+            o
+        } else {
+            // Both moved, to different values: no pushout here. Favour ours,
+            // record the obstruction.
+            conflicts.push(SectionConflict {
+                location: loc.clone(),
+                base: b.cloned(),
+                ours: o.cloned(),
+                theirs: t.cloned(),
+            });
+            o
+        };
+
+        if let Some(v) = chosen {
+            merged.insert(loc.clone(), v.clone());
+        }
+    }
+
+    MergeResult { merged: Section { values: merged }, conflicts }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,5 +461,132 @@ mod tests {
         // Exactly one location changed (the child), and it stayed one edit.
         assert_eq!(p.edits.len(), 1);
         assert_eq!(apply(&p, &a).unwrap(), b);
+    }
+
+    // ── merge_sections: the section pushout ──
+
+    fn sec(t: &TreeNode) -> Section {
+        t.to_section()
+    }
+
+    #[test]
+    fn merge_only_ours_moved_takes_ours() {
+        // theirs == base at the changed point → take ours.
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "99".into();
+        let theirs = sample();
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.merged, sec(&ours));
+    }
+
+    #[test]
+    fn merge_only_theirs_moved_takes_theirs() {
+        let base = sample();
+        let ours = sample();
+        let mut theirs = sample();
+        theirs.children[0].children[0].attributes[0].1 = "77".into();
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.merged, sec(&theirs));
+    }
+
+    #[test]
+    fn merge_disjoint_locations_glue_cleanly() {
+        // ours changes one node, theirs changes a different node → pushout exists.
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "9".into(); // i1
+        let mut theirs = sample();
+        theirs.children[0].children[1].attributes[0].1 = "8".into(); // i2
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        assert!(r.conflicts.is_empty(), "disjoint edits must not conflict");
+        // Both edits present in the merged section.
+        let expected = {
+            let mut e = sample();
+            e.children[0].children[0].attributes[0].1 = "9".into();
+            e.children[0].children[1].attributes[0].1 = "8".into();
+            sec(&e)
+        };
+        assert_eq!(r.merged, expected);
+    }
+
+    #[test]
+    fn merge_identical_move_is_clean() {
+        // Both sides make the SAME edit → glues, no conflict.
+        let base = sample();
+        let mut side = sample();
+        side.children[0].children[0].attributes[0].1 = "same".into();
+        let r = merge_sections(&sec(&base), &sec(&side), &sec(&side));
+        assert!(r.conflicts.is_empty());
+        assert_eq!(r.merged, sec(&side));
+    }
+
+    #[test]
+    fn merge_divergent_move_is_a_conflict() {
+        // Both sides move the SAME location to DIFFERENT values → no pushout.
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "9".into();
+        let mut theirs = sample();
+        theirs.children[0].children[0].attributes[0].1 = "7".into();
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        assert_eq!(r.conflicts.len(), 1, "divergent edit must obstruct the pushout");
+        let c = &r.conflicts[0];
+        assert_eq!(c.location, vec!["root".to_string(), "g1".to_string(), "i1".to_string()]);
+        // Best-effort value favours ours.
+        assert_eq!(r.merged.values.get(&c.location).unwrap().attrs[0].1, "9");
+    }
+
+    #[test]
+    fn merge_modify_delete_is_a_conflict() {
+        // ours modifies a node; theirs deletes it → divergent (o != b, t == ⊥ != b).
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "9".into();
+        let mut theirs = sample();
+        theirs.children[0].children.remove(0); // delete i1
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        // i1's own location conflicts (ours has a value, theirs has ⊥, both != base).
+        let loc = vec!["root".to_string(), "g1".to_string(), "i1".to_string()];
+        assert!(r.conflicts.iter().any(|c| c.location == loc), "modify/delete must conflict at the node");
+        // Favour ours → i1 survives in the merge.
+        assert!(r.merged.values.contains_key(&loc));
+    }
+
+    #[test]
+    fn merge_symmetric_conflict_set() {
+        // Swapping ours/theirs yields the same set of conflicting locations.
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "9".into();
+        let mut theirs = sample();
+        theirs.children[0].children[0].attributes[0].1 = "7".into();
+        let ot = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        let to = merge_sections(&sec(&base), &sec(&theirs), &sec(&ours));
+        let locs = |r: &MergeResult<Section, SectionConflict>| {
+            let mut v: Vec<_> = r.conflicts.iter().map(|c| c.location.clone()).collect();
+            v.sort();
+            v
+        };
+        assert_eq!(locs(&ot), locs(&to));
+    }
+
+    #[test]
+    fn merge_relates_to_patches_apply_both_legs_when_clean() {
+        // When the merge is clean, applying diff(base, theirs) to ours reaches the
+        // merged section — i.e. the pushout really is base + both change sets.
+        let base = sample();
+        let mut ours = sample();
+        ours.children[0].children[0].attributes[0].1 = "9".into(); // i1
+        let mut theirs = sample();
+        theirs.children[0].children[1].attributes[0].1 = "8".into(); // i2
+        let r = merge_sections(&sec(&base), &sec(&ours), &sec(&theirs));
+        assert!(r.conflicts.is_empty());
+        // ours + theirs' leg == merged.
+        let g = diff_sections(&sec(&base), &sec(&theirs));
+        let via_patch = apply_to_section(&g, &sec(&ours)).unwrap();
+        assert_eq!(via_patch, r.merged);
     }
 }

@@ -14,15 +14,19 @@
 //!   position (`order`) and scalar content are values, so a moved or renamed
 //!   node is a value change, not a delete+add. Convert with
 //!   [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
-//! - [`tree`] — the nested [`tree::TreeNode`] view, its structural
-//!   [`tree::tree_diff`], and [`tree::tree_merge`] — the single 3-way merge.
-//!   Merge is total: it always returns a best-effort tree and records every
-//!   gluing obstruction (attribute, text, add/add, modify/delete) as a
-//!   [`tree::TreeConflict`].
 //! - [`patch`] — the lossless patch algebra over sections: `diff` / `apply` /
-//!   `invert` / `compose`, the morphisms of the versioned-structure groupoid.
-//!   Unlike [`tree::tree_diff`] (a lossy display diff) it round-trips; its laws
+//!   `invert` / `compose`, the morphisms of the versioned-structure groupoid,
+//!   plus [`patch::merge_sections`] — the 3-way merge realised as the exact
+//!   **pushout** of the span `ours ← base → theirs`, computed point-wise on the
+//!   [`section::Section`]. Unlike [`tree::tree_diff`] (a lossy display diff) the
+//!   patch algebra round-trips; its laws (including the pushout construction)
 //!   are verified by proptest.
+//! - [`tree`] — the nested [`tree::TreeNode`] view, its structural
+//!   [`tree::tree_diff`], and [`tree::tree_merge`] — the display-oriented 3-way
+//!   merge. It agrees with [`patch::merge_sections`] on *where* conflicts occur,
+//!   but reports each gluing obstruction (attribute, text, add/add,
+//!   modify/delete) with tree-level detail as a [`tree::TreeConflict`], for UIs.
+//!   Both merges are total: they always return a best-effort result.
 //! - [`change`] — versioned change sets: a tree diff or patch tagged with
 //!   metadata (version labels, timestamp, author) for audit and cross-language
 //!   pipelines.

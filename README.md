@@ -10,9 +10,9 @@ Tate is built on one commitment: **every structure is a tree**, and a tree is a 
 
 - **`section`** — The canonical object: a `Section` is the flat `location → value` form of a tree (the sheaf section the algebra runs on). Convert with `TreeNode::to_section` / `Section::to_tree`. Identity is the location; structural position (`order`) and scalar content are values, so moves and renames are value changes, not delete+add.
 
-- **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and `tree_merge` — tate's **single** 3-way merge. Merge is the **pushout** of two branch patches in the category of sections; when change sets are disjoint, the pushout exists and the merge glues cleanly. Where both branches change the same location incompatibly, the obstruction (a `TreeConflict`) is recorded — the conflict set is the first Čech cohomology H¹ of the cover {U_ours, U_theirs}.
+- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure **groupoid**, plus `merge_sections` — the 3-way merge realised as the exact **pushout** of the span `ours ← base → theirs`, computed point-wise on the `Section`. Clean merge = the pushout exists; a conflict is a location where both branches moved to different values (the pushout fails there). Unlike `tree_diff` (a lossy display diff), the algebra round-trips. The laws — `apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, associativity, **and that `merge_sections` equals the point-wise pushout** — are verified by `proptest`.
 
-- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure **groupoid**. Unlike `tree_diff` (a lossy display diff), it round-trips. The laws (`apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, and associativity) are verified by `proptest`.
+- **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and `tree_merge` — the **display-oriented** 3-way merge. It agrees with `merge_sections` on *where* conflicts occur but reports each obstruction (a `TreeConflict`) with tree-level detail (which attribute, old/ours/theirs text, add/add vs modify/delete) for UIs. The conflict set is the first Čech cohomology H¹ of the cover {U_ours, U_theirs}.
 
 - **`change`** — A `ChangeSet`: a tree diff or patch tagged with version metadata (labels, timestamp, author) for audit and cross-language pipelines.
 
@@ -22,7 +22,7 @@ Tate is built on one commitment: **every structure is a tree**, and a tree is a 
 
 ```toml
 [dependencies]
-tate = { version = "0.6", features = ["serde"] }
+tate = { version = "0.7", features = ["serde"] }
 ```
 
 ### Tree diff (format-agnostic)
@@ -74,7 +74,7 @@ assert_eq!(apply(&p, &a).unwrap(), b);          // apply(diff(a, b), a) == b
 tate models structured data as **sections of a location→value sheaf** on the Alexandrov topology of a tree's prefix poset. This is not a metaphor — it is the design:
 
 - **Diff** is point-wise comparison of sections (discrete base space).
-- **Merge** is the **pushout** of two branch patches in the category of sections. Clean merge = pushout exists; conflict = obstruction (pushout does not exist).
+- **Merge** (`patch::merge_sections`) is the **pushout** of the span `ours ← base → theirs` in the category of sections, computed point-wise. Clean merge = pushout exists; conflict = obstruction (pushout does not exist). A proptest law checks the merged section against this definition at every location.
 - **Conflicts** are the **first Čech cohomology** H¹ of the two-cover {U_ours, U_theirs}. Each conflicting location is a generator of H¹.
 - **Patches** form a **groupoid**: every patch has an inverse (`invert`), composition is associative, and the identity is the empty patch. The laws are verified by `proptest` (2000 random cases each).
 
@@ -88,7 +88,7 @@ See [`MATHEMATICS.md`](MATHEMATICS.md) for the full treatment.
 
 - **One object, one merge.** seq / grid / table are not parallel cases — they are trees once keyed. The unification is at the level of the object (`Section`) and the laws, not a pile of per-shape algorithms.
 
-- **Tested.** 42 unit tests + 8 property tests (proptest-verified groupoid laws) + 9 doctests, covering keyless-node bubbling, root tag rename, the four conflict classes, text-vs-attribute merge, and the diff/apply/invert/compose laws.
+- **Tested.** 50 unit tests + 10 property tests (proptest-verified groupoid **and pushout** laws) + 10 doctests, covering keyless-node bubbling, root tag rename, the four conflict classes, text-vs-attribute merge, the diff/apply/invert/compose laws, and the point-wise merge pushout.
 
 ## License
 

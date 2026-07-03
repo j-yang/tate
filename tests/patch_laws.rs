@@ -14,7 +14,7 @@
 //!    (pushout is symmetric) and `merge(base, x, x)` is conflict-free.
 
 use proptest::prelude::*;
-use tate::patch::{apply, compose, diff, invert, Patch};
+use tate::patch::{apply, compose, diff, invert, merge_sections, Patch};
 use tate::tree::{tree_merge, TreeNode};
 
 // ─── strategy: random trees with globally-unique identities ────────────────────
@@ -204,5 +204,59 @@ proptest! {
         a.sort();
         b.sort();
         prop_assert_eq!(a, b);
+    }
+
+    /// Law 7 (pushout construction): the merged section is exactly the point-wise
+    /// pushout of the span `ours ← base → theirs`. At every location the merged
+    /// value must be: theirs where only theirs moved, ours where only ours moved
+    /// (or neither), the common value where both agreed, and ours at conflicts.
+    /// And the conflict set is *precisely* the locations where both legs moved to
+    /// different values — no more, no less. This holds unconditionally (total
+    /// function), so no `prop_assume` is needed.
+    #[test]
+    fn law_merge_is_pointwise_pushout((base, ours) in tree_pair(), theirs_seed in tree_strategy()) {
+        let mut theirs = theirs_seed;
+        theirs.identity = Some("root".into());
+
+        let (sb, so, st) = (base.to_section(), ours.to_section(), theirs.to_section());
+        let r = merge_sections(&sb, &so, &st);
+
+        let conflict_locs: std::collections::BTreeSet<_> =
+            r.conflicts.iter().map(|c| c.location.clone()).collect();
+
+        // Every location present anywhere.
+        let mut locations: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+        locations.extend(sb.values.keys().cloned());
+        locations.extend(so.values.keys().cloned());
+        locations.extend(st.values.keys().cloned());
+
+        for loc in &locations {
+            let b = sb.values.get(loc);
+            let o = so.values.get(loc);
+            let t = st.values.get(loc);
+            let m = r.merged.values.get(loc);
+
+            if o == b {
+                prop_assert_eq!(m, t, "only theirs moved → take theirs at {:?}", loc);
+                prop_assert!(!conflict_locs.contains(loc));
+            } else if t == b || o == t {
+                prop_assert_eq!(m, o, "only ours moved / both agree → take ours at {:?}", loc);
+                prop_assert!(!conflict_locs.contains(loc));
+            } else {
+                // Both moved to different values → conflict, best-effort = ours.
+                prop_assert_eq!(m, o, "conflict favours ours at {:?}", loc);
+                prop_assert!(conflict_locs.contains(loc), "divergent loc {:?} must be a conflict", loc);
+            }
+        }
+    }
+
+    /// Law 8: `merge_sections(base, x, x)` is always clean and returns `x`
+    /// (the pushout of a span with two equal legs is that leg).
+    #[test]
+    fn law_merge_sections_identical_branches((base, side) in tree_pair()) {
+        let (sb, ss) = (base.to_section(), side.to_section());
+        let r = merge_sections(&sb, &ss, &ss);
+        prop_assert!(r.conflicts.is_empty());
+        prop_assert_eq!(r.merged, ss);
     }
 }

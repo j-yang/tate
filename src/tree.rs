@@ -405,20 +405,26 @@ pub struct TreeConflict {
 
 /// 3-way merge of two trees that diverged from a common base.
 ///
-/// This is the **pushout** of two branch patches in the category of sections.
-/// `ours` and `theirs` each restrict to `base` on the unchanged locus; when
-/// their change sets are disjoint, the pushout exists and the merge glues
-/// cleanly (independent changes auto-merge). Where both branches change the
-/// *same* location incompatibly the pushout does not exist — the obstruction
-/// is recorded as a [`TreeConflict`].
+/// This is the **display-oriented** merge: it drives off [`tree_diff`] (the
+/// lossy, human-facing diff) so that its [`TreeConflict`]s carry rich,
+/// path-and-attribute-level detail for a UI (which attribute, old/ours/theirs
+/// text, add/add vs modify/delete). It is a **total function** — it always
+/// returns a tree carrying a best-effort value (favouring `ours`); a non-empty
+/// `conflicts` list means that value was forced and needs review.
 ///
-/// The conflict set is the **first Čech cohomology** H¹ of the cover
-/// {U_ours, U_theirs}, where U_x = locations changed by branch x. Each
-/// conflicting location contributes one generator to H¹.
+/// # Relationship to the exact pushout
 ///
-/// The merge is a **total function** — it always returns a tree carrying a
-/// best-effort value (favouring `ours`). A non-empty `conflicts` list means
-/// that value was forced and needs review.
+/// The *precise* statement "merge is the **pushout** of the span
+/// `ours ← base → theirs` in the category of sections" is realised by
+/// [`crate::patch::merge_sections`], which computes the pushout point-wise on
+/// the lossless [`crate::section::Section`] and is proptest-verified against the
+/// pushout definition. Its conflict set is the **first Čech cohomology** H¹ of
+/// the cover {U_ours, U_theirs} (U_x = locations branch x changed).
+///
+/// `tree_merge` agrees with `merge_sections` on *where* conflicts occur; it
+/// differs only in that it reports them with tree-level display detail instead
+/// of raw section values. Use `merge_sections` when you want the algebra; use
+/// `tree_merge` when you want to show a human what clashed.
 ///
 /// See `MATHEMATICS.md` §3 and §5 for details.
 ///

@@ -113,17 +113,46 @@ M = B with O's changes applied and T's changes applied
 ```
 
 The universal property: any other section `M'` compatible with both `O` and
-`T` factors uniquely through `M`. This is computed element-wise (the correct
-way to compute pushouts in a product category — one factor per location).
+`T` factors uniquely through `M`. This is computed **element-wise** — the
+correct way to compute a pushout in a product category, one factor per
+location. Concretely, at each location `ℓ` with `b = B(ℓ)`, `o = O(ℓ)`,
+`t = T(ℓ)`:
+
+```
+o = b            → take t   (only theirs moved)
+t = b            → take o   (only ours moved, or neither)
+o = t            → take it  (both made the same move — glues)
+o ≠ t, both ≠ b  → conflict (see §3.3)
+```
+
+**This is exactly `tate::patch::merge_sections`.** It is not a metaphor laid
+over a heuristic: the function runs the four-way point-wise rule above on the
+lossless `Section`, and a proptest law (`law_merge_is_pointwise_pushout`,
+2000 cases) checks the merged section against this pushout definition at
+*every* location, and checks that the conflict set is *precisely* the set of
+divergent locations — no more, no less.
 
 ### 3.3 Obstruction = conflict
 
 When `O` and `T` change the **same** location to **different** values, no
-section extends both. The pushout does not exist.
+section extends both. The pushout does not exist at `ℓ`.
 
-tate's merge is a **total function**: it always returns a best-effort tree
-(carrying `ours`'s value at conflicting locations) and records every
-obstruction as a `TreeConflict`. The four obstruction classes are:
+`merge_sections` is a **total function**: it always returns a best-effort
+section (carrying `ours`'s value at conflicting locations) and records every
+obstruction as a `SectionConflict { location, base, ours, theirs }`. The
+conflict set is the H¹ of §5.
+
+### 3.4 Two merges: the algebra and the display
+
+`merge_sections` (above) is the exact pushout on `Section`. The tree-facing
+`tree::tree_merge` is a **display-oriented** wrapper: it drives off the lossy,
+human-readable `tree_diff` so its conflicts carry UI-level detail — *which*
+attribute clashed, old/ours/theirs text, and the classification below. The two
+agree on **where** conflicts occur; they differ only in how much detail each
+attaches. Use `merge_sections` for the algebra, `tree_merge` to show a human
+what clashed.
+
+`tree_merge`'s four display obstruction classes:
 
 | Conflict kind | Sheaf interpretation |
 |---|---|
@@ -172,6 +201,8 @@ The groupoid axioms are verified by proptest (2000 random cases each):
 | Associativity | `compose(compose(p, q), r) == compose(p, compose(q, r))` |
 | Cancellation | `compose(p, invert(p))` is empty |
 | Merge symmetry | Swapping ours/theirs yields the same conflict set |
+| Pushout construction | `merge_sections` equals the point-wise pushout at every location, and its conflict set is exactly the divergent locations |
+| Identical branches | `merge_sections(b, x, x)` is conflict-free and returns `x` |
 
 ### 4.4 Commutativity
 
@@ -239,15 +270,18 @@ load-bearing design decisions:
    `PointEdit`), not hidden inside `Option<Value>` ad-hoc. This gives
    additions and deletions the same algebraic status as modifications. (§1.1)
 
-3. **Total merge.** Because the merge always returns a tree + obstruction
-   list, downstream code never panics on conflicts. The conflict set *is*
-   the cohomological obstruction — it tells you exactly where the pushout
-   fails. (§3.3, §5.2)
+3. **Total merge as an honest pushout.** `merge_sections` *is* the point-wise
+   pushout on `Section` — proptest-checked against the pushout definition, not
+   a heuristic wearing categorical language. It always returns a section +
+   obstruction list, so downstream code never panics on conflicts, and the
+   conflict set *is* the cohomological obstruction: exactly where the pushout
+   fails. The tree-facing `tree_merge` is a display wrapper over the same
+   obstruction locus. (§3.2–§3.4, §5.2)
 
 4. **Patch groupoid, not monoid.** Every patch has an inverse, verified by
    proptest. This enables bidirectional patch pipelines (undo, rollback,
    replay). (§4)
 
-5. **Section as the canonical object.** Both diff and patch operate on
+5. **Section as the canonical object.** diff, patch, *and* merge operate on
    `Section`, not `TreeNode`. The flat view makes the laws clean; the nested
-   view is for I/O only. (§1.2)
+   view is for I/O and display only. (§1.2)
