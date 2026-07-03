@@ -16,8 +16,9 @@
 //!   [`tree::TreeNode::to_section`] / [`section::Section::to_tree`].
 //! - [`patch`] — the lossless patch algebra over sections: `diff` / `apply` /
 //!   `invert` / `compose`, the morphisms of the versioned-structure groupoid,
-//!   plus [`patch::merge_sections`] — the 3-way merge realised as the exact
-//!   **pushout** of the span `ours ← base → theirs`, computed point-wise on the
+//!   plus [`patch::merge_sections`] (3-way) and [`patch::merge_sections_nway`]
+//!   (N-branch) — the merge realised as the exact **pushout** of the span
+//!   `ours ← base → theirs`, computed point-wise on the
 //!   [`section::Section`]. Unlike [`tree::tree_diff`] (a lossy display diff) the
 //!   patch algebra round-trips; its laws (including the pushout construction)
 //!   are verified by proptest.

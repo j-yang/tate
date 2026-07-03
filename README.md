@@ -1,6 +1,6 @@
 # tate
 
-A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a `location → value` sheaf), one 3-way merge, and a lossless patch algebra with proptest-verified laws. Zero format-parsing, zero external diff-engine dependencies.
+A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a `location → value` sheaf), 3-way and N-way merge, and a lossless patch algebra with proptest-verified laws. Zero format-parsing, zero external diff-engine dependencies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -10,19 +10,19 @@ Tate is built on one commitment: **every structure is a tree**, and a tree is a 
 
 - **`section`** — The canonical object: a `Section` is the flat `location → value` form of a tree (the sheaf section the algebra runs on). Convert with `TreeNode::to_section` / `Section::to_tree`. Identity is the location; structural position (`order`) and scalar content are values, so moves and renames are value changes, not delete+add.
 
-- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure **groupoid**, plus `merge_sections` — the 3-way merge realised as the exact **pushout** of the span `ours ← base → theirs`, computed point-wise on the `Section`. Clean merge = the pushout exists; a conflict is a location where both branches moved to different values (the pushout fails there). Unlike `tree_diff` (a lossy display diff), the algebra round-trips. The laws — `apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, associativity, **and that `merge_sections` equals the point-wise pushout** — are verified by `proptest`.
+- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure **groupoid**, plus `merge_sections` (3-way) and `merge_sections_nway` (N-branch) — the merge realised as the exact **pushout** of the span `ours ← base → theirs`, computed point-wise on the `Section`. Clean merge = the pushout exists; a conflict is a location where branches moved to different values. Unlike `tree_diff` (a lossy display diff), the algebra round-trips. The laws — `apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, associativity, identity, **and that `merge_sections` / `merge_sections_nway` equal the point-wise pushout** — are verified by `proptest`.
 
 - **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and `tree_merge` — the **display-oriented** 3-way merge. It agrees with `merge_sections` on *where* conflicts occur but reports each obstruction (a `TreeConflict`) with tree-level detail (which attribute, old/ours/theirs text, add/add vs modify/delete) for UIs. The conflict set is the first Čech cohomology H¹ of the cover {U_ours, U_theirs}.
 
 - **`change`** — A `ChangeSet`: a tree diff or patch tagged with version metadata (labels, timestamp, author) for audit and cross-language pipelines.
 
-> **Byte parsing and alignment live elsewhere.** Turning *files* (Excel, PDF, Word, JSON, plain text) into a tree — including the LCS and coordinate-descent alignment that give un-keyed sequence/grid data stable identities — is the job of the [`mumford`](https://github.com/j-yang/mumford) crate. tate itself is the pure algebra: no format-parsing, no serde_json, no alignment heuristics.
+> **Byte parsing and alignment live elsewhere.** Turning *files* (Excel, PDF, Word, JSON, plain text) into a tree — including the LCS and coordinate-descent alignment that give un-keyed sequence/grid data stable identities — is the job of a separate format-adapter layer. tate itself is the pure algebra: no format-parsing, no serde_json, no alignment heuristics.
 
 ## Usage
 
 ```toml
 [dependencies]
-tate = { version = "0.7", features = ["serde"] }
+tate = { version = "1", features = ["serde"] }
 ```
 
 ### Tree diff (format-agnostic)
@@ -84,11 +84,11 @@ See [`MATHEMATICS.md`](MATHEMATICS.md) for the full treatment.
 
 - **Self-contained.** Zero external dependencies beyond `serde` (optional, behind the default `serde` feature). No `similar`, no `roxmltree`, no `serde_json`, no `imara-diff`.
 
-- **Format-agnostic.** `tree_diff` / `tree_merge` / `patch` operate on `TreeNode` (equivalently, its `Section`) — callers convert from XML, JSON, YAML, or any tree format. tate has no file-format knowledge; parsing and alignment live in `mumford`.
+- **Format-agnostic.** `tree_diff` / `tree_merge` / `patch` operate on `TreeNode` (equivalently, its `Section`) — callers convert from XML, JSON, YAML, or any tree format. tate has no file-format knowledge.
 
 - **One object, one merge.** seq / grid / table are not parallel cases — they are trees once keyed. The unification is at the level of the object (`Section`) and the laws, not a pile of per-shape algorithms.
 
-- **Tested.** 50 unit tests + 10 property tests (proptest-verified groupoid **and pushout** laws) + 10 doctests, covering keyless-node bubbling, root tag rename, the four conflict classes, text-vs-attribute merge, the diff/apply/invert/compose laws, and the point-wise merge pushout.
+- **Tested.** 50 unit tests + 12 property tests (proptest-verified groupoid **and pushout** laws, including N-way) + 10 doctests.
 
 ## License
 
