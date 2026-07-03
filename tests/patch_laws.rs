@@ -14,7 +14,7 @@
 //!    (pushout is symmetric) and `merge(base, x, x)` is conflict-free.
 
 use proptest::prelude::*;
-use tate::patch::{apply, compose, diff, invert, merge_sections, Patch};
+use tate::patch::{apply, compose, diff, invert, merge_sections, merge_sections_nway, Patch};
 use tate::tree::{tree_merge, TreeNode};
 
 // ─── strategy: random trees with globally-unique identities ────────────────────
@@ -176,6 +176,15 @@ proptest! {
         prop_assert_eq!(compose(&p, &invert(&p)), Patch::empty());
     }
 
+    /// Law 5b: composing with the identity patch is a no-op (left and right
+    /// identity — completes the groupoid identity axiom).
+    #[test]
+    fn law_compose_identity((a, b) in tree_pair()) {
+        let p = diff(&a, &b);
+        prop_assert_eq!(compose(&p, &Patch::empty()), p.clone());
+        prop_assert_eq!(compose(&Patch::empty(), &p), p);
+    }
+
     /// Law 6a: merging a base with two identical branches yields no conflict
     /// and returns that branch (pushout of a span with equal legs is trivial).
     #[test]
@@ -258,5 +267,54 @@ proptest! {
         let r = merge_sections(&sb, &ss, &ss);
         prop_assert!(r.conflicts.is_empty());
         prop_assert_eq!(r.merged, ss);
+    }
+
+    /// Law 9 (N-way pushout): `merge_sections_nway` produces exactly the
+    /// point-wise N-way pushout. At every location, if all moving branches
+    /// agree on one value, that value is taken; if ≥2 distinct non-base values
+    /// appear, the location is a conflict. This holds unconditionally.
+    #[test]
+    fn law_nway_merge_is_pointwise_pushout(
+        base_seed in tree_strategy(),
+        branch_seeds in prop::collection::vec(tree_strategy(), 2..5),
+    ) {
+        let mut base_tree = base_seed;
+        base_tree.identity = Some("root".into());
+        let base = base_tree.to_section();
+
+        let branches: Vec<_> = branch_seeds.into_iter().map(|mut t| {
+            t.identity = Some("root".into());
+            t.to_section()
+        }).collect();
+
+        let r = merge_sections_nway(&base, &branches);
+
+        let conflict_locs: std::collections::BTreeSet<Vec<String>> =
+            r.conflicts.iter().map(|c| c.location.clone()).collect();
+
+        let mut locations: std::collections::BTreeSet<Vec<String>> = std::collections::BTreeSet::new();
+        locations.extend(base.values.keys().cloned());
+        for b in &branches {
+            locations.extend(b.values.keys().cloned());
+        }
+
+        for loc in &locations {
+            let b = base.values.get(loc);
+            let moved: std::collections::BTreeSet<Option<&tate::section::Value>> = branches.iter()
+                .map(|s| s.values.get(loc))
+                .filter(|v| v != &b)
+                .collect();
+
+            if moved.len() <= 1 {
+                prop_assert!(!conflict_locs.contains(loc),
+                    "non-conflict at {:?} but in conflict set", loc);
+                let expected = if moved.is_empty() { b } else { *moved.iter().next().unwrap() };
+                prop_assert_eq!(r.merged.values.get(loc), expected,
+                    "wrong merged value at {:?}", loc);
+            } else {
+                prop_assert!(conflict_locs.contains(loc),
+                    "conflict at {:?} but missing from conflict set", loc);
+            }
+        }
     }
 }

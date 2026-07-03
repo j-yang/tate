@@ -56,7 +56,7 @@ pub type Location = Vec<String>;
 /// Per the sheaf model, structural position (`order` among siblings) is part of
 /// the value, not the location — so moving a node to a new parent is a value
 /// change at a stable location, not a delete+add.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Value {
     pub kind: String,

@@ -361,6 +361,69 @@ pub fn merge_sections(base: &Section, ours: &Section, theirs: &Section) -> Merge
     MergeResult { merged: Section { values: merged }, conflicts }
 }
 
+/// N-way merge: the pushout of N branches diverged from a common base.
+///
+/// At each location, the branches that moved (value ≠ base) must all agree on
+/// the same target value. If they do, the move is taken; if ≥2 distinct
+/// non-base values appear, the pushout fails there. For 2 branches this is
+/// identical to [`merge_sections`].
+///
+/// With ≥3 branches, conflicts capture **triple inconsistencies**: three
+/// branches where every pair could pairwise-merge, but the triple disagrees.
+/// On a discrete location space these reduce to "≥2 distinct non-base values at
+/// the same location" — the multi-cover H¹ from MATHEMATICS.md §5.3.
+pub fn merge_sections_nway(base: &Section, branches: &[Section]) -> MergeResult<Section, SectionConflict> {
+    match branches.len() {
+        0 => return MergeResult { merged: base.clone(), conflicts: Vec::new() },
+        1 => return MergeResult { merged: branches[0].clone(), conflicts: Vec::new() },
+        _ => {}
+    }
+
+    let mut merged_map = BTreeMap::new();
+    let mut conflicts = Vec::new();
+
+    let mut locations: std::collections::BTreeSet<&Location> = base.values.keys().collect();
+    for b in branches {
+        locations.extend(b.values.keys());
+    }
+
+    for loc in locations {
+        let b = base.values.get(loc);
+
+        let moved: std::collections::BTreeSet<Option<&Value>> = branches.iter()
+            .map(|s| s.values.get(loc))
+            .filter(|v| v != &b)
+            .collect();
+
+        if moved.is_empty() {
+            if let Some(v) = b {
+                merged_map.insert(loc.clone(), v.clone());
+            }
+        } else if moved.len() == 1 {
+            if let Some(v) = *moved.iter().next().unwrap() {
+                merged_map.insert(loc.clone(), v.clone());
+            }
+        } else {
+            let ours = branches.first().and_then(|s| s.values.get(loc));
+            let theirs = branches.iter()
+                .skip(1)
+                .find(|s| s.values.get(loc) != ours)
+                .and_then(|s| s.values.get(loc));
+            conflicts.push(SectionConflict {
+                location: loc.clone(),
+                base: b.cloned(),
+                ours: ours.cloned(),
+                theirs: theirs.cloned(),
+            });
+            if let Some(v) = ours {
+                merged_map.insert(loc.clone(), v.clone());
+            }
+        }
+    }
+
+    MergeResult { merged: Section { values: merged_map }, conflicts }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
