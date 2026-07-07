@@ -105,6 +105,9 @@ pub struct PointEdit {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Patch {
     /// Edits keyed by location. `BTreeMap` gives a canonical, deterministic order.
+    /// Serialized as a sequence of `[location, edit]` pairs so it round-trips
+    /// through JSON (whose object keys must be strings; a location is a list).
+    #[cfg_attr(feature = "serde", serde(with = "crate::loc_map_serde"))]
     pub edits: BTreeMap<Location, PointEdit>,
 }
 
@@ -651,5 +654,27 @@ mod tests {
         let g = diff_sections(&sec(&base), &sec(&theirs));
         let via_patch = apply_to_section(&g, &sec(&ours)).unwrap();
         assert_eq!(via_patch, r.merged);
+    }
+
+    // A location-keyed map (Vec<String> keys) must round-trip through JSON, whose
+    // object keys must be strings. Regression for the "key must be a string" error.
+    #[cfg(feature = "serde")]
+    #[test]
+    fn patch_and_section_roundtrip_through_json() {
+        let a = sample();
+        let mut b = sample();
+        b.children[0].children[0].attributes[0].1 = "9".into();
+
+        let p = diff(&a, &b);
+        assert!(!p.is_empty());
+        let json = serde_json::to_string(&p).expect("patch must serialize to JSON");
+        let back: Patch = serde_json::from_str(&json).expect("patch must deserialize");
+        assert_eq!(p, back);
+        assert_eq!(apply(&back, &a).unwrap(), b);
+
+        let s = sec(&a);
+        let sj = serde_json::to_string(&s).expect("section must serialize to JSON");
+        let sback: Section = serde_json::from_str(&sj).expect("section must deserialize");
+        assert_eq!(s, sback);
     }
 }

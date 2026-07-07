@@ -79,6 +79,9 @@ pub struct Value {
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Section {
     /// Location → value. `BTreeMap` gives a canonical, deterministic order.
+    /// Serialized as a sequence of `[location, value]` pairs so it round-trips
+    /// through JSON (whose object keys must be strings; a location is a list).
+    #[cfg_attr(feature = "serde", serde(with = "crate::loc_map_serde"))]
     pub values: BTreeMap<Location, Value>,
 }
 
