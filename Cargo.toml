@@ -1,6 +1,6 @@
 [package]
 name = "tate"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2021"
 license = "MIT"
 description = "A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a location→value sheaf), 3-way and N-way merge, and a lossless patch algebra with proptest-verified laws"
