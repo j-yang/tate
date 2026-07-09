@@ -139,6 +139,14 @@ impl Repo {
         self.section(commit).to_tree().unwrap_or_default()
     }
 
+    /// Get the [`TreeNode`] for a section hash directly (not a commit hash).
+    pub fn section_as_tree(&self, section_hash: Hash) -> TreeNode {
+        self.sections
+            .get(&section_hash)
+            .map(|s| s.to_tree().unwrap_or_default())
+            .unwrap_or_default()
+    }
+
     /// Diff two commits: returns the [`Patch`] from `a` to `b`.
     pub fn diff(&self, a: Hash, b: Hash) -> Patch {
         patch::diff_sections(self.section(a), self.section(b))
