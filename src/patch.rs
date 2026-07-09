@@ -279,6 +279,71 @@ pub fn compose(p: &Patch, q: &Patch) -> Patch {
 
 // ─── merge: the section pushout ────────────────────────────────────────────────
 
+/// Try to merge two Values field-by-field (per-attribute merge).
+/// Returns Some(merged) if all fields can be resolved, None if any field conflicts.
+fn try_merge_value(base: &Value, ours: &Value, theirs: &Value) -> Option<Value> {
+    let kind = merge_field(&ours.kind, &base.kind, &theirs.kind)?;
+    let label = merge_field(&ours.label, &base.label, &theirs.label)?;
+    let text = merge_field(&ours.text, &base.text, &theirs.text)?;
+    let order = merge_field(&ours.order, &base.order, &theirs.order)?;
+    let attrs = merge_attrs(&ours.attrs, &base.attrs, &theirs.attrs)?;
+    Some(Value { kind, label, text, attrs, order })
+}
+
+fn merge_field<T: PartialEq + Clone>(o: &T, b: &T, t: &T) -> Option<T> {
+    if o == b { Some(t.clone()) }
+    else if t == b { Some(o.clone()) }
+    else if o == t { Some(o.clone()) }
+    else { None }
+}
+
+fn merge_attrs(
+    ours: &[(String, String)],
+    base: &[(String, String)],
+    theirs: &[(String, String)],
+) -> Option<Vec<(String, String)>> {
+    use std::collections::BTreeMap;
+    let om: BTreeMap<&str, &str> = ours.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let bm: BTreeMap<&str, &str> = base.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let tm: BTreeMap<&str, &str> = theirs.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+
+    let mut keys: std::collections::BTreeSet<&str> = om.keys().copied().collect();
+    keys.extend(bm.keys().copied());
+    keys.extend(tm.keys().copied());
+
+    let mut result = Vec::new();
+    for key in keys {
+        let ov = om.get(key).copied();
+        let bv = bm.get(key).copied();
+        let tv = tm.get(key).copied();
+        let merged = match (ov, bv, tv) {
+            (Some(o), Some(b), Some(t)) => {
+                if o == b { Some(t) }
+                else if t == b { Some(o) }
+                else if o == t { Some(o) }
+                else { return None }
+            }
+            (Some(o), Some(b), None) => {
+                if o == b { None } else { return None }
+            }
+            (Some(o), None, Some(t)) => {
+                if o == t { Some(o) } else { return None }
+            }
+            (None, Some(b), Some(t)) => {
+                if b == t { None } else { return None }
+            }
+            (Some(o), None, None) => Some(o),
+            (None, Some(_), None) => None,
+            (None, None, Some(t)) => Some(t),
+            (None, None, None) => None,
+        };
+        if let Some(v) = merged {
+            result.push((key.to_string(), v.to_string()));
+        }
+    }
+    Some(result)
+}
+
 /// 3-way merge as the **pushout** of two branch patches in the category of
 /// sections.
 ///
@@ -332,29 +397,42 @@ pub fn merge_sections(base: &Section, ours: &Section, theirs: &Section) -> Merge
 
         // Point-wise pushout. `chosen` is the value the merged section carries at
         // `loc` (None = the location is absent in the merge).
-        let chosen: Option<&Value> = if o == b {
-            // Only theirs (possibly) moved this point.
-            t
+        let chosen: Option<Value> = if o == b {
+            t.cloned()
         } else if t == b {
-            // Only ours moved this point.
-            o
+            o.cloned()
         } else if o == t {
-            // Both made the identical move — the pushout glues cleanly.
-            o
+            o.cloned()
+        } else if let (Some(bv), Some(ov), Some(tv)) = (b, o, t) {
+            // All three exist but differ as whole Values.
+            // Try per-field merge: kind, label, text, order, and each attribute
+            // are merged independently. This lets two branches that changed
+            // different attributes of the same node merge cleanly.
+            match try_merge_value(bv, ov, tv) {
+                Some(merged) => Some(merged),
+                None => {
+                    conflicts.push(SectionConflict {
+                        location: loc.clone(),
+                        base: b.cloned(),
+                        ours: o.cloned(),
+                        theirs: t.cloned(),
+                    });
+                    o.cloned()
+                }
+            }
         } else {
-            // Both moved, to different values: no pushout here. Favour ours,
-            // record the obstruction.
+            // Structural conflict (modify/delete or add/add with different values).
             conflicts.push(SectionConflict {
                 location: loc.clone(),
                 base: b.cloned(),
                 ours: o.cloned(),
                 theirs: t.cloned(),
             });
-            o
+            o.cloned()
         };
 
         if let Some(v) = chosen {
-            merged.insert(loc.clone(), v.clone());
+            merged.insert(loc.clone(), v);
         }
     }
 

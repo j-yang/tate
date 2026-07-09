@@ -31,6 +31,8 @@
 //! - [`change`] — versioned change sets: a tree diff or patch tagged with
 //!   metadata (version labels, timestamp, author) for audit and cross-language
 //!   pipelines.
+//! - [`repo`] — a version control kernel: content-addressed sections, commit DAG,
+//!   merge (pushout), cherry-pick, revert, branches.
 //!
 //! Diff two trees:
 //! ```
@@ -68,5 +70,6 @@
 
 pub mod change;
 pub mod patch;
+pub mod repo;
 pub mod section;
 pub mod tree;
