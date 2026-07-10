@@ -1,94 +1,167 @@
 # tate
 
-A pure structured diff, patch, and merge algebra for Rust — one object (a tree = a section of a `location → value` sheaf), 3-way and N-way merge, and a lossless patch algebra with proptest-verified laws. Zero format-parsing, zero external diff-engine dependencies.
+A version control kernel for structured data — identity-keyed sections with
+field-wise pushout merge and a lossless patch algebra. Zero format-parsing,
+zero external diff-engine dependencies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+## What changed in 2.0
+
+**Identity is separated from location.** In tate 1.x, a node's key in the
+section was its full path from root. In tate 2.0, the key is the node's
+**identity** (a string), and its position (parent, order) is stored as a
+**field** of the node.
+
+This separation enables:
+
+- **Move is a field change, not delete+insert.** Moving a node changes its
+  `parent` field at a stable identity key.
+- **Move + Modify merge cleanly.** Alice moves a node (changes `parent`),
+  Bob modifies its value (changes `text`/`attrs`). Different fields →
+  field-wise pushout merge resolves both independently → no false conflict.
+- **Field-wise merge.** Each field (`parent`, `kind`, `label`, `text`,
+  `attrs`, `order`) is merged independently. Two branches that change
+  different attributes of the same node merge cleanly.
+
 ## Overview
 
-Tate is built on one commitment: **every structure is a tree**, and a tree is a *section* of a `location → value` sheaf. Diff, 3-way merge, and a lossless patch algebra are defined once, on that single object. Four modules, zero format-parsing and zero external diff-engine dependencies (only optional `serde`):
+- **`section`** — The canonical object: `Section = BTreeMap<Identity, Node>`.
+  Each `Node` stores its `parent` (position), `kind`, `label`, `text`,
+  `attrs`, and `order`. Identity is the key; position is a value.
 
-- **`section`** — The canonical object: a `Section` is the flat `location → value` form of a tree (the sheaf section the algebra runs on). Convert with `TreeNode::to_section` / `Section::to_tree`. Identity is the location; structural position (`order`) and scalar content are values, so moves and renames are value changes, not delete+add.
+- **`patch`** — Lossless patch algebra: `diff` / `apply` / `invert` /
+  `compose`. Plus `merge_sections` (3-way) and `merge_sections_nway`
+  (N-branch) — the **field-wise pushout** merge. At each identity, each
+  field is merged independently. Laws verified by proptest (2000 cases).
 
-- **`patch`** — A lossless patch algebra over sections: `diff` / `apply` / `invert` / `compose`, the morphisms of the versioned-structure **groupoid**, plus `merge_sections` (3-way) and `merge_sections_nway` (N-branch) — the merge realised as the exact **pushout** of the span `ours ← base → theirs`, computed point-wise on the `Section`. Clean merge = the pushout exists; a conflict is a location where branches moved to different values. Unlike `tree_diff` (a lossy display diff), the algebra round-trips. The laws — `apply(diff(a, b), a) == b`, `invert` undoes `apply`, `compose` equals sequential `apply`, associativity, identity, **and that `merge_sections` / `merge_sections_nway` equal the point-wise pushout** — are verified by `proptest`.
+- **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and
+  `tree_merge` — the display-oriented merge for UIs.
 
-- **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and `tree_merge` — the **display-oriented** 3-way merge. It agrees with `merge_sections` on *where* conflicts occur but reports each obstruction (a `TreeConflict`) with tree-level detail (which attribute, old/ours/theirs text, add/add vs modify/delete) for UIs. The conflict set is the first Čech cohomology H¹ of the cover {U_ours, U_theirs}.
+- **`change`** — Versioned change sets with metadata for audit pipelines.
 
-- **`change`** — A `ChangeSet`: a tree diff or patch tagged with version metadata (labels, timestamp, author) for audit and cross-language pipelines.
-
-> **Byte parsing and alignment live elsewhere.** Turning *files* (Excel, PDF, Word, JSON, plain text) into a tree — including the LCS and coordinate-descent alignment that give un-keyed sequence/grid data stable identities — is the job of a separate format-adapter layer. tate itself is the pure algebra: no format-parsing, no serde_json, no alignment heuristics.
+- **`repo`** — VCS kernel: content-addressed sections, commit DAG,
+  merge (pushout), cherry-pick, revert, branches.
 
 ## Usage
 
 ```toml
 [dependencies]
-tate = { version = "1", features = ["serde"] }
+tate = { version = "2", features = ["serde"] }
 ```
 
-### Tree diff (format-agnostic)
+### Tree diff
 
 ```rust
 use tate::tree::{TreeNode, tree_diff, ChangeKind};
 
 let a = TreeNode::new("root")
-    .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "1"));
+    .with_child(TreeNode::new("server").with_identity("s1").with_attr("port", "8080"));
 let b = TreeNode::new("root")
-    .with_child(TreeNode::new("entry").with_identity("u1").with_attr("level", "99"));
+    .with_child(TreeNode::new("server").with_identity("s1").with_attr("port", "9090"));
 
-let diff = tree_diff(&a, &b);
-assert_eq!(diff.changes.len(), 1);
-assert_eq!(diff.changes[0].kind, ChangeKind::Modified);
+let d = tree_diff(&a, &b);
+assert_eq!(d.changes[0].kind, ChangeKind::Modified);
 ```
 
-### 3-way merge (the single merge)
+### Move + Modify clean merge (the 2.0 feature)
 
 ```rust
 use tate::tree::{TreeNode, tree_merge};
 
-let base = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "1"));
-let ours = TreeNode::new("root").with_child(TreeNode::new("e").with_identity("u1").with_attr("v", "9"));
-let theirs = base.clone();
+let base = TreeNode::new("root")
+    .with_child(TreeNode::new("server").with_identity("s1").with_attr("port", "8080"))
+    .with_child(TreeNode::new("db").with_identity("d1"));
 
-let r = tree_merge(&base, &ours, &theirs);      // ours changed v, theirs did not
-assert_eq!(r.conflicts.len(), 0);               // clean glue
-assert_eq!(r.tree.children[0].attr("v"), Some("9"));
+// Alice moves s1 under d1.
+let mut moved = base.clone();
+let s1 = moved.children.remove(0);
+moved.children[0].children.push(s1);
+
+// Bob modifies s1's port.
+let mut modified = base.clone();
+modified.children[0].attributes[0].1 = "9090".into();
+
+// Merge: move (parent field) + modify (attrs field) → clean.
+let r = tree_merge(&base, &moved, &modified);
+// tree_merge may still conflict (it's display-oriented);
+// use merge_sections for the field-wise pushout:
+use tate::patch::merge_sections;
+let result = merge_sections(
+    &base.to_section(),
+    &moved.to_section(),
+    &modified.to_section(),
+);
+assert!(result.conflicts.is_empty()); // field-wise merge resolves cleanly
 ```
 
-### Lossless patch (round-trips)
+### In-app version control (Repo)
 
 ```rust
 use tate::tree::TreeNode;
-use tate::patch::{diff, apply};
+use tate::repo::Repo;
 
-let a = TreeNode::new("root").with_child(TreeNode::new("x").with_identity("1"));
-let b = TreeNode::new("root")
-    .with_child(TreeNode::new("x").with_identity("1"))
-    .with_child(TreeNode::new("y").with_identity("2"));
+let mut repo = Repo::new();
 
-let p = diff(&a, &b);
-assert_eq!(apply(&p, &a).unwrap(), b);          // apply(diff(a, b), a) == b
+let v0 = repo.commit("initial", &[], &TreeNode::new("root")
+    .with_child(TreeNode::new("server").with_identity("s1").with_attr("port", "8080")));
+
+let v1 = repo.commit("port -> 9090", &[v0], &TreeNode::new("root")
+    .with_child(TreeNode::new("server").with_identity("s1").with_attr("port", "9090")));
+
+let patch = repo.diff(v0, v1);
+for (id, edit) in &patch.edits {
+    println!("  {id}: {:?} -> {:?}", edit.old, edit.new);
+}
 ```
 
 ## Mathematical foundation
 
-tate models structured data as **sections of a location→value sheaf** on the Alexandrov topology of a tree's prefix poset. This is not a metaphor — it is the design:
+tate models structured data as **identity-keyed sections**. A section maps
+`Identity → Node`, where each `Node` stores both position (`parent`, `order`)
+and content (`kind`, `text`, `attrs`).
 
-- **Diff** is point-wise comparison of sections (discrete base space).
-- **Merge** (`patch::merge_sections`) is the **pushout** of the span `ours ← base → theirs` in the category of sections, computed point-wise. Clean merge = pushout exists; conflict = obstruction (pushout does not exist). A proptest law checks the merged section against this definition at every location.
-- **Conflicts** are the **first Čech cohomology** H¹ of the two-cover {U_ours, U_theirs}. Each conflicting location is a generator of H¹.
-- **Patches** form a **groupoid**: every patch has an inverse (`invert`), composition is associative, and the identity is the empty patch. The laws are verified by `proptest` (2000 random cases each).
+**Merge** is the **field-wise pushout** of the span `ours ← base → theirs`.
+At each identity, each field is merged independently:
+
+- If only one side changed a field → take that value.
+- If both changed it to the same value → take it.
+- If both changed it to different values → conflict.
+
+This is the categorical pushout in the product category
+∏<sub>(identity, field)</sub> Set — one factor per (identity, field) pair.
+
+**Patches** form a **groupoid**: every patch has an inverse (`invert`),
+composition is associative, and the identity is the empty patch. The laws
+are verified by proptest (2000 random cases each).
+
+**Key insight**: separating identity from location enables Move + Modify
+commutation — they touch different fields of the same node, so they
+commute trivially. This is impossible in location-keyed models (including
+Pijul's line-based patch theory), where Move changes the key.
 
 See [`MATHEMATICS.md`](MATHEMATICS.md) for the full treatment.
 
 ## Design
 
-- **Self-contained.** Zero external dependencies beyond `serde` (optional, behind the default `serde` feature). No `similar`, no `roxmltree`, no `serde_json`, no `imara-diff`.
+- **Self-contained.** Zero external dependencies beyond `serde` (optional).
+- **Identity-keyed.** The fundamental data structure is
+  `BTreeMap<Identity, Node>`, not `BTreeMap<Path, Value>`.
+- **Field-wise merge.** Different fields of the same node merge independently.
+- **VCS kernel.** Content-addressed storage + commit DAG + pushout merge.
+- **Tested.** 58 unit tests + 12 property tests + 5 doctests = 75 total.
 
-- **Format-agnostic.** `tree_diff` / `tree_merge` / `patch` operate on `TreeNode` (equivalently, its `Section`) — callers convert from XML, JSON, YAML, or any tree format. tate has no file-format knowledge.
+## Migration from 1.x
 
-- **One object, one merge.** seq / grid / table are not parallel cases — they are trees once keyed. The unification is at the level of the object (`Section`) and the laws, not a pile of per-shape algorithms.
+**Breaking changes:**
 
-- **Tested.** 50 unit tests + 12 property tests (proptest-verified groupoid **and pushout** laws, including N-way) + 10 doctests.
+- `Section.values: BTreeMap<Location, Value>` → `Section.nodes: BTreeMap<Identity, Node>`
+- `Patch.edits: BTreeMap<Location, PointEdit>` → `Patch.edits: BTreeMap<Identity, NodeEdit>`
+- `SectionConflict.location` → `SectionConflict.identity`
+- `Value` → `Node` (adds `parent` field)
+- `PointEdit` → `NodeEdit`
+
+The tree-facing API (`TreeNode`, `tree_diff`, `tree_merge`) is unchanged.
 
 ## License
 

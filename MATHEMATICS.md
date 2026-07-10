@@ -1,165 +1,125 @@
 # Mathematical Foundation
 
-tate models structured data as **sections of a location→value sheaf**. This
-document makes that statement precise and connects it to the code.
+tate 2.0 models structured data as **identity-keyed sections**. This document
+makes the design precise and connects it to the code.
 
 ---
 
-## 1. The sheaf model
+## 1. The identity-section model
 
-### 1.1 Trees as sheaves
+### 1.1 Identity ≠ Location
 
-A tree is a sheaf on the **Alexandrov topology** of its prefix poset: the set
-of locations (paths from the root), ordered by the prefix relation `≤` (a
-location is ≤ its extensions). The open sets are downward-closed sets of
-locations (subtrees rooted at some node).
-
-A **section** of this sheaf assigns to each location a **value**:
+In tate 2.0, a **section** is a map:
 
 ```
-Section = Location → Value
+Section = Identity → Node
 ```
 
-where:
+where `Identity` is a string (the node's stable identifier) and `Node` stores
+both position and content:
 
-- **Location** = the sequence of sibling keys from the root to the node.
-  A key is the node's **identity** (if it has one) or its **kind** (positional).
-  Identity-as-key is the load-bearing choice: a node keeps its location when
-  its content changes, so a moved or renamed node is a *value change* at a
-  stable location, not a delete+add.
+```
+Node = {
+    parent: Option<Identity>,   // structural position
+    kind: String,               // element type
+    label: String,              // human-readable name
+    text: String,               // text content
+    attrs: Vec<(String, String)>, // key-value attributes
+    order: usize,               // index among siblings
+}
+```
 
-- **Value** = everything intrinsic to a node except which children it has:
-  `kind`, `label`, `text`, `attributes`, and `order` (index among siblings).
-  Structural position (`order`) is part of the value, not the location — this
-  is the sheaf split that makes moves detectable as value-level edits.
+The **key design decision**: identity is the map key, and position (`parent`,
+`order`) is a *value* stored inside the node. This means:
 
-- **⊥** (the absent value) = a location not present in the map. Patches use
-  `Option<Value>` to talk about absence explicitly (`None` = ⊥).
+- A **Move** changes `parent` at a stable identity key — not a delete+insert
+  at two different path keys.
+- A **Modify** changes `text`/`attrs` at a stable identity key.
+- **Move and Modify touch different fields of the same node** → they are
+  independent operations → they commute.
 
-**The gluing axiom holds automatically.** Trees are contractible in the
-Alexandrov topology (they have a unique root = initial element), so any
-locally consistent assignment of values to locations extends uniquely to a
-global section. This means the sheaf is well-defined and the algebra on it
-is exact.
+### 1.2 Why this matters
 
-### 1.2 The two views
+In tate 1.x (and in all path-keyed diff systems, including git), a node's key
+is its path from the root. Moving a node changes its path → the key changes →
+the diff sees delete+insert. This makes Move + Modify impossible to merge
+cleanly: the modify targets a node that was "deleted."
 
-tate provides two interconvertible views of the same data:
+In tate 2.0, the key is stable (identity). Move changes a field (`parent`),
+not the key. Two branches that touch different fields of the same node
+merge cleanly via the field-wise pushout.
 
-- **`TreeNode`** — the nested view. Format parsers produce it, UIs consume
-  it, humans read it.
-- **`Section`** — the flat view: `BTreeMap<Location, Value>`. This is the
-  object the algebra runs on, because on the flat view an edit is a point
-  change and the laws are clean.
+### 1.3 Equivalence: (Identity, Field) pairs
 
-Round-tripping (`to_section` / `to_tree`) is the identity on trees whose
-siblings have distinct keys.
+A section is equivalently a flat map:
+
+```
+Section ≅ BTreeMap<(Identity, Field), Value>
+```
+
+where `Field ∈ {parent, kind, label, text, order, attr₁, attr₂, …}`.
+
+This is the **sheaf on a discrete space** — the space of (identity, field)
+pairs. Each pair maps to a scalar value.
 
 ---
 
 ## 2. Diff as section difference
 
-Given two sections `S₁` and `S₂`, the **diff** is the set of locations where
-values differ:
+Given two sections `S₁` and `S₂`, the diff is the set of (identity, field)
+pairs where values differ. At the node level, this means: for each identity,
+compare every field. If any field differs, emit a `NodeEdit` recording the
+old and new node.
 
-```
-diff(S₁, S₂) = { (loc, S₁(loc), S₂(loc)) | S₁(loc) ≠ S₂(loc) }
-```
-
-This is a point-wise comparison on a discrete base space. It is complete:
-every difference is captured, no heuristic is involved.
-
-`tate::tree::tree_diff` is the display-layer version (it summarises changes
-for humans, bubbling keyless descendants to their nearest identity-bearing
-ancestor). `tate::patch::diff` is the lossless version (it records exactly
-enough to reconstruct the target from the source).
+This is complete: every change is captured, no heuristic is involved.
 
 ---
 
-## 3. Merge as pushout
+## 3. Merge as field-wise pushout
 
 ### 3.1 The categorical setup
 
-Define the **category of sections** `Sec`:
-
-- **Objects**: sections (`BTreeMap<Location, Value>`)
-- **Morphisms**: patches (location-keyed point edits, see §4)
-- **Composition**: patch composition
-- **Identities**: empty patches
-
-Given a base section `B` and two branches `O` (ours) and `T` (theirs), each
-related to `B` by a patch:
+The category of sections `Sec` is a **product category**:
 
 ```
-    O
-   ↑
-   | f = patch(B → O)
-   |
-   B
-   |
-   | g = patch(B → T)
-   ↓
-   T
+Sec = ∏_{(I, f)} Set    (one factor per identity-field pair)
 ```
 
-### 3.2 Clean merge = pushout
+Pushouts in a product category are computed **point-wise** (one factor at a
+time). This is the standard result from category theory.
 
-When `O` and `T` change **disjoint** sets of locations, the **pushout** of
-`f` and `g` exists. It is the section `M` obtained by applying both change
-sets to `B`:
+### 3.2 The point-wise rule
 
-```
-M = B with O's changes applied and T's changes applied
-```
-
-The universal property: any other section `M'` compatible with both `O` and
-`T` factors uniquely through `M`. This is computed **element-wise** — the
-correct way to compute a pushout in a product category, one factor per
-location. Concretely, at each location `ℓ` with `b = B(ℓ)`, `o = O(ℓ)`,
-`t = T(ℓ)`:
+At each (identity, field) pair, with base `b`, ours `o`, theirs `t`:
 
 ```
-o = b            → take t   (only theirs moved)
-t = b            → take o   (only ours moved, or neither)
-o = t            → take it  (both made the same move — glues)
-o ≠ t, both ≠ b  → conflict (see §3.3)
+o = b  →  take t          (only theirs moved this field)
+t = b  →  take o          (only ours moved this field)
+o = t  →  take it         (both made the same change — glues)
+o ≠ t, both ≠ b  →  conflict (the pushout does not exist at this pair)
 ```
 
-**This is exactly `tate::patch::merge_sections`.** It is not a metaphor laid
-over a heuristic: the function runs the four-way point-wise rule above on the
-lossless `Section`, and a proptest law (`law_merge_is_pointwise_pushout`,
-2000 cases) checks the merged section against this pushout definition at
-*every* location, and checks that the conflict set is *precisely* the set of
-divergent locations — no more, no less.
+### 3.3 Clean merge
 
-### 3.3 Obstruction = conflict
+When all three sides exist at an identity but differ as whole nodes, the
+field-wise merge tries **each field independently**:
 
-When `O` and `T` change the **same** location to **different** values, no
-section extends both. The pushout does not exist at `ℓ`.
+- `parent`: if only one side changed it → take that side's parent
+- `kind`: same logic
+- `text`: same logic
+- `attrs`: each attribute key merged independently
+- `order`: same logic
 
-`merge_sections` is a **total function**: it always returns a best-effort
-section (carrying `ours`'s value at conflicting locations) and records every
-obstruction as a `SectionConflict { location, base, ours, theirs }`. The
-conflict set is the H¹ of §5.
+If all fields merge cleanly → the node merges cleanly, even though the whole
+nodes differed. This is what enables **Move + Modify clean merge**: Move
+changes `parent`, Modify changes `text`/`attrs` — different fields, same node.
 
-### 3.4 Two merges: the algebra and the display
+### 3.4 Conflict = field-level obstruction
 
-`merge_sections` (above) is the exact pushout on `Section`. The tree-facing
-`tree::tree_merge` is a **display-oriented** wrapper: it drives off the lossy,
-human-readable `tree_diff` so its conflicts carry UI-level detail — *which*
-attribute clashed, old/ours/theirs text, and the classification below. The two
-agree on **where** conflicts occur; they differ only in how much detail each
-attaches. Use `merge_sections` for the algebra, `tree_merge` to show a human
-what clashed.
-
-`tree_merge`'s four display obstruction classes:
-
-| Conflict kind | Sheaf interpretation |
-|---|---|
-| `Attr` | Both sides set the same attribute to different values |
-| `Text` | Both sides changed the same node's text content differently |
-| `AddAdd` | Both sides added a node at the same path with differing content |
-| `ModifyDelete` | One side modified a node the other removed |
+A conflict occurs at an (identity, field) pair when both sides changed that
+specific field to incompatible values. The conflict set is the set of such
+pairs. On a discrete (identity, field) space, this is the first Čech
+cohomology H¹ of the cover {U_ours, U_theirs}.
 
 ---
 
@@ -167,30 +127,16 @@ what clashed.
 
 ### 4.1 Patches as morphisms
 
-A **patch** is a location-keyed map of point edits:
+A patch is an identity-keyed map of node edits:
 
 ```
-Patch = BTreeMap<Location, PointEdit>
-PointEdit = { old: Option<Value>, new: Option<Value> }
+Patch = BTreeMap<Identity, NodeEdit>
+NodeEdit = { old: Option<Node>, new: Option<Node> }
 ```
-
-`None` represents ⊥ (absent). The invariant `old ≠ new` holds for every
-edit.
 
 ### 4.2 Groupoid structure
 
-Patches form a **groupoid** (a category in which every morphism is
-invertible):
-
-- **Objects**: sections
-- **Morphisms**: patches
-- **Identity**: `Patch::empty()` (no edits)
-- **Composition**: `compose(p, q)` — element-wise, with cancellation
-- **Inverse**: `invert(p)` — swap `old` and `new` in every edit
-
-### 4.3 Verified laws
-
-The groupoid axioms are verified by proptest (2000 random cases each):
+Patches form a groupoid (verified by proptest, 2000 random cases each):
 
 | Law | Statement |
 |---|---|
@@ -200,88 +146,64 @@ The groupoid axioms are verified by proptest (2000 random cases each):
 | Composition | `apply(compose(p, q), a) == apply(q, apply(p, a))` |
 | Associativity | `compose(compose(p, q), r) == compose(p, compose(q, r))` |
 | Cancellation | `compose(p, invert(p))` is empty |
-| Merge symmetry | Swapping ours/theirs yields the same conflict set |
-| Pushout construction | `merge_sections` equals the point-wise pushout at every location, and its conflict set is exactly the divergent locations |
-| Identical branches | `merge_sections(b, x, x)` is conflict-free and returns `x` |
+| Left/right identity | `compose(p, empty) == p == compose(empty, p)` |
 
-### 4.4 Commutativity
+### 4.3 Commutation via field independence
 
-On a discrete location space, patches at different locations **trivially
-commute**: `compose(p, q) == compose(q, p)` when `p` and `q` touch disjoint
-locations. This makes the groupoid **abelian** on non-overlapping patches.
+**Theorem (Field Independence):** Patches that touch different fields of the
+same identity commute.
 
-Non-trivial commutativity (patches that interact at the same location but
-in compatible ways) is the subject of future structural-operation work.
+*Proof:* Each field edit is an independent entry in the equivalent
+`BTreeMap<(Identity, Field), Value>`. Edits at different keys are
+independent → commute. QED.
+
+**Corollary (Move-Modify Commutation):**
+`Move(I, A→B) ∘ Modify(I, v→w) = Modify(I, v→w) ∘ Move(I, A→B)`
+
+*Proof:* Move touches `(I, parent)`. Modify touches `(I, text)` or
+`(I, attrs)`. Different fields → by Field Independence, they commute. QED.
+
+This commutation is **impossible in path-keyed models** (including tate 1.x
+and Pijul's line-based theory), because Move changes the key, making the two
+operations interact.
 
 ---
 
-## 5. Cohomological interpretation of conflicts
+## 5. Comparison with Pijul
 
-### 5.1 Čech complex for merge
+| | Pijul | tate 2.0 |
+|---|---|---|
+| Data model | Text lines (position-based) | Tree nodes (identity-based) |
+| Patch commutation | Line-level (adjacent lines) | Field-level (different fields of same node) |
+| Move handling | Position shift | `parent` field change |
+| Move + Modify | May conflict (position changes) | Always commutes (different fields) |
+| Merge algorithm | Commutation + composition | Field-wise pushout |
+| Merge base | Patch dependency graph | Commit DAG (LCA) |
+| Conflict representation | Text markers / patch sets | (Identity, field) pairs |
 
-Given base `B` and branches `O`, `T`, define the cover:
-
-- `U_O` = locations changed by `O` (relative to `B`)
-- `U_T` = locations changed by `T`
-
-The **Čech complex** for this cover with values in the section sheaf:
-
-- `C⁰` = assignments to each open set
-- `C¹` = assignments to the intersection `U_O ∩ U_T`
-- `δ⁰: C⁰ → C¹` = restriction to the intersection (check agreement)
-
-### 5.2 Cohomology groups
-
-- **H⁰ = ker(δ⁰)** = assignments that agree on the intersection = **clean
-  merges** (no conflicts).
-
-- **H¹ = coker(δ⁰)** = disagreements on the intersection = **the conflict
-  set**. Each conflicting location contributes one generator to H¹.
-
-- **H^k = 0 for k ≥ 2**: with a two-set cover, the Čech complex has no
-  higher simplices.
-
-### 5.3 Multi-way merge
-
-For `n` branches, the cover has `n` open sets. The Čech complex has
-non-trivial higher structure:
-
-- **H¹** captures pairwise conflicts (two branches disagree at a location).
-- **H²** captures triple inconsistencies: three branches where every pair
-  agrees, but the triple is inconsistent. These are invisible to sequential
-  pairwise merging.
-
-On a discrete location space, H^k = 0 for k ≥ 2 regardless of cover size
-(local sections always glue point-wise). The interesting cohomology arises
-from the **cover topology** (how branches overlap), not the data topology.
+tate's merge is **snapshot-based** (pushout on sections), not
+**patch-based** (commutation on operations). This means:
+- Merge does not require commutation — it works on any three sections.
+- Cherry-pick and rebase are `apply`-based (simpler, less flexible than
+  Pijul's commutation-based versions).
+- For structured data (where changes are usually disjoint by identity),
+  this is sufficient.
 
 ---
 
 ## 6. Design consequences
 
-The sheaf perspective is not merely descriptive — it drove several
-load-bearing design decisions:
+1. **Identity as key.** A node's identity is its map key; position is a value.
+   Move is a parent-field change, not a delete+insert.
 
-1. **Identity as location.** A node's identity is its address; structural
-   position is a value. This makes moves and renames value-level edits,
-   not delete+add pairs. (§1.1)
+2. **Field-wise merge.** Each field is merged independently. This resolves
+   Move + Modify, reorder + modify, and different-attribute changes
+   automatically — all are "different fields, same node."
 
-2. **Explicit absence (⊥).** Absent locations are first-class (`None` in
-   `PointEdit`), not hidden inside `Option<Value>` ad-hoc. This gives
-   additions and deletions the same algebraic status as modifications. (§1.1)
+3. **Field-wise pushout.** The merge is the categorical pushout in the
+   product category ∏(identity, field) Set. Proptest checks the pushout
+   property at every (identity, field) pair.
 
-3. **Total merge as an honest pushout.** `merge_sections` *is* the point-wise
-   pushout on `Section` — proptest-checked against the pushout definition, not
-   a heuristic wearing categorical language. It always returns a section +
-   obstruction list, so downstream code never panics on conflicts, and the
-   conflict set *is* the cohomological obstruction: exactly where the pushout
-   fails. The tree-facing `tree_merge` is a display wrapper over the same
-   obstruction locus. (§3.2–§3.4, §5.2)
-
-4. **Patch groupoid, not monoid.** Every patch has an inverse, verified by
-   proptest. This enables bidirectional patch pipelines (undo, rollback,
-   replay). (§4)
-
-5. **Section as the canonical object.** diff, patch, *and* merge operate on
-   `Section`, not `TreeNode`. The flat view makes the laws clean; the nested
-   view is for I/O and display only. (§1.2)
+4. **Patch groupoid with field-level commutation.** The groupoid laws are
+   verified. The Field Independence theorem gives a sound basis for
+   commutation — patches on different fields always commute.
