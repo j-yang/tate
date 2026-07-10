@@ -1,0 +1,8 @@
+[package]
+name = "tate-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+tate = { path = ".." }
