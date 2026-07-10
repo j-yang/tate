@@ -1,43 +1,15 @@
-//! The canonical object: a *section* of the location→value sheaf.
+//! Identity-keyed section: the canonical form of a tree.
 //!
-//! tate has two views of the same data:
+//! In tate 2.0, a [`Section`] maps [`Identity`] → [`Node`], where each Node
+//! stores its parent's identity (not its path from root). This separation of
+//! identity from position enables:
 //!
-//! - [`TreeNode`](crate::tree) — the **nested** view. Parsers produce
-//!   it, UIs consume it, humans read it.
-//! - [`Section`] — the **flat** view: a map from every [`Location`] to the
-//!   [`Value`] living there. This is the object the diff/patch/merge algebra is
-//!   defined on, because on the flat view an edit is a point change and the laws
-//!   (`apply(diff(a,b),a)==b`, invertibility, composition) are clean.
-//!
-//! The two are interconvertible: [`TreeNode::to_section`] flattens,
-//! [`Section::to_tree`] rebuilds. Round-tripping is the identity on trees whose
-//! siblings have distinct keys (see below).
-//!
-//! # Location and Value — the sheaf split
-//!
-//! A [`Location`] is the path of sibling **keys** from the root to a node. A key
-//! is the node's identity if it has one, otherwise its kind. Identity-as-key is
-//! the load-bearing choice: a node keeps its location when its content changes,
-//! so a moved or renamed node is a *value* change at a stable location, not a
-//! delete+add.
-//!
-//! A [`Value`] is everything intrinsic to a node *except* which children it has:
-//! kind, label, text, attributes, and `order` (its index among siblings). Which
-//! children a node has is encoded structurally — by which *other* locations
-//! exist in the section — so it is not stored in the value. Per the sheaf model,
-//! structural position (`order`) is part of the value, not the location.
-//!
-//! `⊥` (the absent value) is represented by a location simply not being present
-//! in the map. A [`crate::patch::Patch`] uses `Option<Value>` to talk about the
-//! absent state explicitly (`None` = ⊥).
-//!
-//! # Precondition: unique sibling keys
-//!
-//! The flat view is faithful when siblings have distinct keys — the canonical
-//! case for identity-keyed data (JSON objects, XML with `id`/`OID`, tables with
-//! primary keys). Keyless siblings that share a kind (bare array items, un-keyed
-//! grid rows) collide at one location; giving them stable keys is the job of the
-//! keying adapters, not this core.
+//! - **Move as a field-level change**: moving a node changes its `parent`
+//!   field, not its key in the map.
+//! - **Move + Modify merge cleanly**: moving (parent field) and modifying
+//!   (value fields) touch different fields of the same node → commute.
+//! - **Field-wise pushout merge**: each field (parent, kind, text, attrs,
+//!   order) is merged independently.
 
 use std::collections::BTreeMap;
 
@@ -46,166 +18,145 @@ use serde::{Deserialize, Serialize};
 
 use crate::tree::TreeNode;
 
-/// A location in the tree: the sequence of sibling keys from the root down to a
-/// node. A key is the node's identity if set, otherwise its kind.
-pub type Location = Vec<String>;
+/// A node's unique identifier. Used as the key in a [`Section`].
+pub type Identity = String;
 
-/// The value living at one location: everything intrinsic to a node *except*
-/// which children it has (that is encoded by which other locations exist).
+/// A node in the section: everything intrinsic to a tree node, including its
+/// parent reference (position) and scalar content (value).
 ///
-/// Per the sheaf model, structural position (`order` among siblings) is part of
-/// the value, not the location — so moving a node to a new parent is a value
-/// change at a stable location, not a delete+add.
+/// The `parent` field separates identity (the key) from position (where the
+/// node sits in the tree). A move is a `parent` change; a modification is a
+/// value change. They touch different fields → they commute.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-pub struct Value {
+pub struct Node {
+    /// Parent's identity. `None` for the root.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub parent: Option<Identity>,
+    /// Element type (XML tag name, JSON object key, etc.)
     pub kind: String,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub label: String,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "String::is_empty"))]
     pub text: String,
-    /// Attributes kept in their original order — reordering is a value change.
+    /// Key-value attributes, in original order.
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Vec::is_empty"))]
     pub attrs: Vec<(String, String)>,
-    /// Index among the parent's children (structural position as value).
+    /// Index among siblings.
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "is_zero_usize"))]
     pub order: usize,
 }
 
-/// A section of the location→value sheaf: the flat, canonical form of a tree.
+fn is_zero_usize(v: &usize) -> bool {
+    *v == 0
+}
+
+/// A section: identity → node. The canonical, flat form of a tree.
 ///
-/// This is *the object* of tate's algebra. [`crate::patch::diff`] takes two
-/// sections to a patch; [`crate::patch::apply`] transports a section along one.
+/// This is the object on which diff/patch/merge are defined. Moving a node
+/// changes its `parent` field at a stable identity key — not a delete+insert
+/// at two different location keys.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct Section {
-    /// Location → value. `BTreeMap` gives a canonical, deterministic order.
-    /// Serialized as a sequence of `[location, value]` pairs so it round-trips
-    /// through JSON (whose object keys must be strings; a location is a list).
-    #[cfg_attr(feature = "serde", serde(with = "crate::loc_map_serde"))]
-    pub values: BTreeMap<Location, Value>,
-}
-
-/// The key locating a node among its siblings: identity if present, else kind.
-pub fn loc_segment(n: &TreeNode) -> String {
-    match &n.identity {
-        Some(id) => id.clone(),
-        None => n.kind.clone(),
-    }
+    pub nodes: BTreeMap<Identity, Node>,
 }
 
 impl Section {
-    /// An empty section (no locations) — the flat form of `⊥` everywhere.
     pub fn new() -> Self {
-        Section { values: BTreeMap::new() }
+        Section { nodes: BTreeMap::new() }
     }
 
-    /// True if this section has no locations.
     pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
+        self.nodes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.nodes.len()
     }
 
     /// Rebuild the nested [`TreeNode`] from this section.
     ///
-    /// Returns `None` if the section is empty or has no single root (a location
-    /// of length 1). Children are ordered by their stored [`Value::order`].
+    /// Returns `None` if the section is empty or has no root (a node with
+    /// `parent = None`). Children are ordered by their `order` field.
     pub fn to_tree(&self) -> Option<TreeNode> {
-        if self.values.is_empty() {
+        if self.nodes.is_empty() {
             return None;
         }
-        // Build a bare node (no children yet) for every location.
-        let mut nodes: BTreeMap<Location, TreeNode> = BTreeMap::new();
-        for (loc, v) in &self.values {
-            nodes.insert(
-                loc.clone(),
-                TreeNode {
-                    kind: v.kind.clone(),
-                    identity: loc.last().and_then(|seg| {
-                        // Recover identity: a node is identity-keyed iff its key
-                        // differs from its kind (kind-keyed nodes are positional).
-                        if seg != &v.kind { Some(seg.clone()) } else { None }
-                    }),
-                    label: v.label.clone(),
-                    attributes: v.attrs.clone(),
-                    text: v.text.clone(),
-                    children: Vec::new(),
-                },
-            );
+        let root_id = self.nodes.iter()
+            .find(|(_, n)| n.parent.is_none())
+            .map(|(id, _)| id.clone())?;
+        self.build_node(&root_id)
+    }
+
+    fn build_node(&self, id: &str) -> Option<TreeNode> {
+        let node = self.nodes.get(id)?;
+        let mut tree = TreeNode::new(&node.kind);
+        // Recover identity: if key != kind, it was an explicit identity.
+        if id != node.kind {
+            tree.identity = Some(id.to_string());
         }
-        // Group children under their parent location.
-        let mut pending: BTreeMap<Location, Vec<(usize, Location)>> = BTreeMap::new();
-        for loc in self.values.keys() {
-            if loc.len() >= 2 {
-                let parent = loc[..loc.len() - 1].to_vec();
-                let order = self.values.get(loc).map(|v| v.order).unwrap_or(0);
-                pending.entry(parent).or_default().push((order, loc.clone()));
+        tree.label = node.label.clone();
+        tree.text = node.text.clone();
+        tree.attributes = node.attrs.clone();
+
+        // Find children (nodes whose parent == this id), sorted by order.
+        let mut children: Vec<(&Identity, &Node)> = self.nodes.iter()
+            .filter(|(_, n)| n.parent.as_deref() == Some(id))
+            .collect();
+        children.sort_by_key(|(_, n)| n.order);
+
+        for (cid, _) in children {
+            if let Some(child) = self.build_node(cid) {
+                tree.children.push(child);
             }
         }
-        // Attach children to parents, deepest parents first, so a subtree is
-        // complete before its root is itself moved upward. Sort by stored order.
-        let mut parent_locs: Vec<Location> = pending.keys().cloned().collect();
-        parent_locs.sort_by_key(|l| std::cmp::Reverse(l.len()));
-        for parent in parent_locs {
-            let mut kids = pending.remove(&parent).unwrap_or_default();
-            kids.sort_by_key(|(order, _)| *order);
-            for (_, child_loc) in kids {
-                if let Some(child) = nodes.remove(&child_loc) {
-                    if let Some(p) = nodes.get_mut(&parent) {
-                        p.children.push(child);
-                    }
-                }
-            }
-        }
-        // The sole remaining length-1 location is the root.
-        let root_loc = nodes.keys().find(|l| l.len() == 1).cloned()?;
-        nodes.remove(&root_loc)
+        Some(tree)
     }
 }
 
 impl TreeNode {
-    /// Flatten this tree into its [`Section`]: a map from every location to the
-    /// value living there. The inverse of [`Section::to_tree`].
+    /// Flatten this tree into a [`Section`]: identity → node.
+    ///
+    /// Nodes with explicit identity use it as their key. Nodes without
+    /// identity use their kind as the key (matching the old location-segment
+    /// behavior). Keyless siblings of the same kind collide — that is the
+    /// keying adapter's job to resolve, not tate core's.
     pub fn to_section(&self) -> Section {
-        let mut values = BTreeMap::new();
-        let mut path = vec![loc_segment(self)];
-        flatten_into(self, 0, &mut path, &mut values);
-        Section { values }
+        let mut nodes = BTreeMap::new();
+        flatten_node(self, None, 0, &mut nodes);
+        Section { nodes }
     }
 }
 
-fn flatten_into(
+fn flatten_node(
     node: &TreeNode,
+    parent: Option<&str>,
     order: usize,
-    path: &mut Location,
-    map: &mut BTreeMap<Location, Value>,
+    nodes: &mut BTreeMap<Identity, Node>,
 ) {
-    map.insert(
-        path.clone(),
-        Value {
-            kind: node.kind.clone(),
-            label: node.label.clone(),
-            text: node.text.clone(),
-            attrs: node.attributes.clone(),
-            order,
-        },
-    );
+    let id = node.identity.clone().unwrap_or_else(|| node.kind.clone());
+    nodes.insert(id.clone(), Node {
+        parent: parent.map(String::from),
+        kind: node.kind.clone(),
+        label: node.label.clone(),
+        text: node.text.clone(),
+        attrs: node.attributes.clone(),
+        order,
+    });
     for (i, child) in node.children.iter().enumerate() {
-        path.push(loc_segment(child));
-        flatten_into(child, i, path, map);
-        path.pop();
+        flatten_node(child, Some(&id), i, nodes);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tree::TreeNode;
 
     fn sample() -> TreeNode {
         TreeNode::new("root")
             .with_child(
-                TreeNode::new("group")
-                    .with_identity("g1")
-                    .with_attr("name", "vitals")
+                TreeNode::new("group").with_identity("g1").with_attr("name", "vitals")
                     .with_child(TreeNode::new("item").with_identity("i1").with_attr("v", "1"))
                     .with_child(TreeNode::new("item").with_identity("i2").with_attr("v", "2")),
             )
@@ -213,7 +164,7 @@ mod tests {
     }
 
     #[test]
-    fn to_section_to_tree_roundtrips() {
+    fn roundtrip() {
         let t = sample();
         let s = t.to_section();
         assert!(!s.is_empty());
@@ -221,29 +172,52 @@ mod tests {
     }
 
     #[test]
-    fn section_records_order_as_value() {
+    fn identity_is_key() {
         let s = sample().to_section();
-        // g1 is child 0, g2 is child 1 of root.
-        let g1 = s.values.get(&vec!["root".to_string(), "g1".to_string()]).unwrap();
-        let g2 = s.values.get(&vec!["root".to_string(), "g2".to_string()]).unwrap();
-        assert_eq!(g1.order, 0);
-        assert_eq!(g2.order, 1);
+        assert!(s.nodes.contains_key("root"));
+        assert!(s.nodes.contains_key("g1"));
+        assert!(s.nodes.contains_key("i1"));
+    }
+
+    #[test]
+    fn parent_field_set() {
+        let s = sample().to_section();
+        assert_eq!(s.nodes["root"].parent, None);
+        assert_eq!(s.nodes["g1"].parent.as_deref(), Some("root"));
+        assert_eq!(s.nodes["i1"].parent.as_deref(), Some("g1"));
+    }
+
+    #[test]
+    fn order_field_set() {
+        let s = sample().to_section();
+        assert_eq!(s.nodes["g1"].order, 0);
+        assert_eq!(s.nodes["g2"].order, 1);
+    }
+
+    #[test]
+    fn move_is_parent_change() {
+        // Build a tree, move a node, check that only the parent field changed.
+        let t = sample();
+        let s1 = t.to_section();
+
+        // Move i1 from g1 to g2.
+        let mut moved = t.clone();
+        moved.children[1].children.push(TreeNode::new("item").with_identity("i1").with_attr("v", "1"));
+        moved.children[0].children.retain(|c| c.identity.as_deref() != Some("i1"));
+        let s2 = moved.to_section();
+
+        // i1's identity is the same key in both sections.
+        assert!(s1.nodes.contains_key("i1"));
+        assert!(s2.nodes.contains_key("i1"));
+        // Only the parent changed.
+        assert_eq!(s1.nodes["i1"].parent.as_deref(), Some("g1"));
+        assert_eq!(s2.nodes["i1"].parent.as_deref(), Some("g2"));
+        // Other fields unchanged.
+        assert_eq!(s1.nodes["i1"].attrs, s2.nodes["i1"].attrs);
     }
 
     #[test]
     fn empty_section_has_no_tree() {
-        assert_eq!(Section::new().to_tree(), None);
-    }
-
-    #[test]
-    fn keyless_node_keyed_by_kind() {
-        // A node without identity is located by its kind.
-        let t = TreeNode::new("root").with_child(TreeNode::new("leaf").with_text("x"));
-        let s = t.to_section();
-        assert!(s.values.contains_key(&vec!["root".to_string(), "leaf".to_string()]));
-        // Round-trips: kind-keyed node recovers to identity = None.
-        let back = s.to_tree().unwrap();
-        assert_eq!(back.children[0].identity, None);
-        assert_eq!(back, t);
+        assert!(Section::new().to_tree().is_none());
     }
 }
