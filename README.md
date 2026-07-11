@@ -1,8 +1,9 @@
 # tate
 
-A version control kernel for structured data — identity-keyed sections with
-field-wise pushout merge and a lossless patch algebra. Zero format-parsing,
-zero external diff-engine dependencies.
+A version control kernel for structured data — a sheaf on the tree space
+with a two-stage pushout merge (pointwise per-field + sheafification for
+referential integrity). Zero format-parsing, zero external diff-engine
+dependencies.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
@@ -23,6 +24,9 @@ This separation enables:
 - **Field-wise merge.** Each field (`parent`, `kind`, `label`, `text`,
   `attrs`, `order`) is merged independently. Two branches that change
   different attributes of the same node merge cleanly.
+- **Structural (Dangling) conflicts.** Sheafification drops present nodes
+  whose parent was concurrently deleted — an obstruction no discrete
+  per-field model can detect.
 
 ## Overview
 
@@ -32,8 +36,10 @@ This separation enables:
 
 - **`patch`** — Lossless patch algebra: `diff` / `apply` / `invert` /
   `compose`. Plus `merge_sections` (3-way) and `merge_sections_nway`
-  (N-branch) — the **field-wise pushout** merge. At each identity, each
-  field is merged independently. Laws verified by proptest (2000 cases).
+  (N-branch) — the **sheaf pushout** on the tree space. Stage 1 merges
+  each field independently; Stage 2 (sheafification) drops dangling-parent
+  nodes, reporting `Field` and `Dangling` conflicts. Laws + the sheaf
+  consistency invariant verified by proptest (2000 cases).
 
 - **`tree`** — The nested `TreeNode` view, its structural `tree_diff`, and
   `tree_merge` — the display-oriented merge for UIs.
@@ -117,51 +123,67 @@ for (id, edit) in &patch.edits {
 
 ## Mathematical foundation
 
-tate models structured data as **identity-keyed sections**. A section maps
-`Identity → Node`, where each `Node` stores both position (`parent`, `order`)
-and content (`kind`, `text`, `attrs`).
+tate models structured data as a **sheaf on the tree space**. The base
+space is the identity poset with the **Alexandrov topology of ancestry**
+(opens = ancestor-closed subtrees), not a discrete key set. A section of
+the sheaf assigns each identity a node state and must satisfy
+**referential integrity**: a present node has a present parent.
 
-**Merge** is the **field-wise pushout** of the span `ours ← base → theirs`.
-At each identity, each field is merged independently:
+**Merge** is the **pushout in the sheaf category** of the span
+`ours ← base → theirs`, computed in two stages:
 
-- If only one side changed a field → take that value.
-- If both changed it to the same value → take it.
-- If both changed it to different values → conflict.
+1. **Pointwise per-field pushout** — at each identity, each field
+   (`parent`, `kind`, `label`, `text`, `attrs`, `order`) is merged by the
+   four-way rule (take-t / take-o / take-agreed / conflict).
+2. **Sheafification** — a fixpoint that drops present nodes whose `parent`
+   is absent, enforcing the integrity constraint.
 
-This is the categorical pushout in the product category
-∏<sub>(identity, field)</sub> Set — one factor per (identity, field) pair.
+This yields **two conflict classes**:
+
+- `Field` — both branches changed the same field to incompatible values
+  (the only kind a discrete per-field model can see).
+- `Dangling` — the pointwise pushout left a present node referencing an
+  absent parent. This is a *structural* obstruction that the ancestry
+  topology surfaces and any discrete model is blind to (proven strictly:
+  there are inputs where the discrete merge reports zero conflicts yet
+  returns a non-section).
+
+**Identity-location separation** composes with the sheaf: a node's
+identity is its key, its position (`parent`) is a value. Move is a
+parent-field change, not a delete+insert; so Move + Modify touch different
+fields of the same node and merge cleanly (Stage 1), with Stage 2 never
+firing because the moved node's new parent is present.
 
 **Patches** form a **groupoid**: every patch has an inverse (`invert`),
 composition is associative, and the identity is the empty patch. The laws
 are verified by proptest (2000 random cases each).
 
-**Key insight**: separating identity from location enables Move + Modify
-commutation — they touch different fields of the same node, so they
-commute trivially. This is impossible in location-keyed models (including
-Pijul's line-based patch theory), where Move changes the key.
+On a flat tree the topology is discrete, sheafification is the identity,
+and the merge specialises to the classical per-field pushout — the new
+content is exactly what the ancestry topology buys.
 
-See [`MATHEMATICS.md`](MATHEMATICS.md) for the full treatment.
+The full treatment — definitions, theorems (Sheaf Pushout Correctness,
+Sheaf Consistency, Strict Refinement), and proofs — is in
+[`paper/main.tex`](paper/main.tex).
 
 ## Design
 
 - **Self-contained.** Zero external dependencies beyond `serde` (optional).
 - **Identity-keyed.** The fundamental data structure is
   `BTreeMap<Identity, Node>`, not `BTreeMap<Path, Value>`.
-- **Field-wise merge.** Different fields of the same node merge independently.
+- **Sheaf on the tree space.** Merge is the sheaf pushout; output is always
+  a consistent section (referential integrity enforced by sheafification).
 - **VCS kernel.** Content-addressed storage + commit DAG + pushout merge.
-- **Tested.** 58 unit tests + 12 property tests + 5 doctests = 75 total.
+- **Tested.** 60 unit tests + 13 property tests + 5 doctests = 78 total.
 
-## Migration from 1.x
+## Limitations
 
-**Breaking changes:**
-
-- `Section.values: BTreeMap<Location, Value>` → `Section.nodes: BTreeMap<Identity, Node>`
-- `Patch.edits: BTreeMap<Location, PointEdit>` → `Patch.edits: BTreeMap<Identity, NodeEdit>`
-- `SectionConflict.location` → `SectionConflict.identity`
-- `Value` → `Node` (adds `parent` field)
-- `PointEdit` → `NodeEdit`
-
-The tree-facing API (`TreeNode`, `tree_diff`, `tree_merge`) is unchanged.
+| Gap | Impact |
+|-----|--------|
+| **No move detection in `tree_diff`.** A moved node (same identity, new parent) is reported as remove + add. The section-level diff (`patch::diff`) does capture move as a `parent` field change. | Display diff is coarser than the algebra. |
+| **Keyless siblings collide.** `to_section` keys a node by its `kind` when no identity is set; same-kind keyless siblings overwrite each other silently. Assigning stable identities is the caller's responsibility. | Arrays / positional lists need an external keying step. |
+| **Snapshot-based merge.** Merge works on sections, not on a patch-commutation algebra; cherry-pick/rebase are `apply`-based and less flexible than Pijul's. | Rare in the identity-keyed setting, but a real expressiveness gap. |
+| **`order` integrity not enforced.** Sheafification checks parent integrity only; duplicate or non-contiguous `order` values among siblings are not flagged. | Future sheaf constraint. |
 
 ## License
 

@@ -1,0 +1,604 @@
+% Identity-Aware Merge for Structured Data:
+% Field-Wise Pushout with Separated Identity and Location
+%
+% Draft for arXiv cs.SE
+
+\documentclass[11pt,a4paper]{article}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{lemma}[theorem]{Lemma}
+\newtheorem{corollary}[theorem]{Corollary}
+\newtheorem{definition}[theorem]{Definition}
+\newtheorem{remark}[theorem]{Remark}
+
+\newcommand{\Id}{\mathsf{Id}}
+\newcommand{\Field}{\mathsf{Field}}
+\newcommand{\Node}{\mathsf{Node}}
+\newcommand{\Section}{\mathsf{Section}}
+\newcommand{\Patch}{\mathsf{Patch}}
+
+\title{Merge for Structured Data as a Sheaf on the Tree Space:\\
+Referential Integrity via Sheafification}
+
+\author{
+Author One\thanks{Affiliation} \and
+Author Two\thanks{Affiliation}
+}
+
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Three-way merge for tree-structured data (JSON, YAML, XML) is commonly framed
+as a per-field pushout on a discrete product of stalks --- one factor per
+(identity, field) pair. We argue this framing is too weak: by placing the
+topology on the \emph{tree} (the Alexandrov topology of the ancestry poset)
+rather than on a discrete set, merge becomes the pushout in the sheaf category
+$Sh(\Id)$, and sheafification enforces a \emph{referential-integrity
+constraint} (a present node must have a present parent). This gives a new class
+of merge obstruction --- a \emph{structural conflict} (a present child whose
+parent was deleted on the other branch) --- that the discrete per-field model
+is provably blind to.
+
+Concretely, we (i) separate identity from location so that Move is a field
+change, enabling Move+Modify to commute; (ii) define merge as the two-stage
+pushout $\Sigma(m_0)$ --- pointwise per-field pushout $m_0$ in the presheaf
+category, followed by sheafification $\Sigma$ that drops dangling references to
+a fixpoint; (iii) prove a Strict-Refinement theorem: the sheaf conflict set
+strictly contains the discrete one, the gap being exactly the structural
+conflicts, non-empty iff the tree has depth $\geq 1$ and the two branches'
+edits cross an ancestry edge inconsistently. We implement the algorithm in
+Rust (open source, 78 tests) and verify the sheaf-consistency invariant and
+the groupoid laws by property-based testing (2000 cases each).
+\end{abstract}
+
+
+% ============================================================
+\section{Introduction}
+% ============================================================
+
+Version control systems merge concurrent edits by comparing two branches
+against a common base. Git performs this comparison at the granularity of
+\emph{text lines}: two edits conflict if they fall in the same 3-line
+context window. Pijul performs it at the granularity of \emph{patches}
+on a flat sequence, with commutation rules for adjacent lines.
+
+Both approaches are designed for \emph{source code}---flat sequences of
+text lines. But an increasing fraction of version-controlled data is
+\emph{structured}: JSON configurations, YAML manifests, XML documents,
+database schemas. These have a tree shape with stable identities (object
+keys, element IDs, primary keys). For such data, two distinct defects of
+line-based merge arise. First, \emph{false conflicts}: two developers
+editing different fields of the same JSON object trigger a conflict
+because their edits are textually adjacent, even though they are logically
+disjoint. Second, and less noticed, \emph{silent structural violations}:
+when one branch deletes a parent element and another edits its child,
+line-based merge (and, as we show, the discrete per-field merge) will
+happily keep the child with a reference to a now-absent parent --- a
+dangling reference that is not a section of any well-formed tree.
+
+\paragraph{Contribution.}
+We make four contributions:
+
+\begin{enumerate}[noitemsep]
+\item \textbf{The tree-space sheaf} (\S\ref{sec:model}): we place the
+topology on the tree (Alexandrov topology of the ancestry poset) rather
+than on a discrete key set. Sections of the sheaf satisfy a
+referential-integrity constraint: a present node has a present parent.
+
+\item \textbf{Two-stage sheaf merge} (\S\ref{sec:merge}): merge is the
+pushout $\Sigma(m_0)$ in $Sh(\Id)$ --- a pointwise per-field pushout $m_0$
+in the presheaf category, followed by sheafification $\Sigma$ that drops
+dangling references to a fixpoint. Combined with identity-location
+separation, Move+Modify merges cleanly because they touch different fields.
+
+\item \textbf{Theorems} (\S\ref{sec:theory}): Sheaf Pushout Correctness,
+Sheaf Consistency (the output is always a valid section), and Strict
+Refinement over the discrete per-field merge --- the gap being exactly the
+new \emph{structural conflict} class, invisible to any discrete model.
+
+\item \textbf{Implementation} (\S\ref{sec:impl}): an open-source Rust
+library (\texttt{tate}) with 78 tests; the sheaf-consistency invariant
+and the patch groupoid laws are verified by proptest (2000 cases each).
+\end{enumerate}
+
+
+% ============================================================
+\section{The Tree-Space Sheaf}
+\label{sec:model}
+% ============================================================
+
+The decisive modelling choice is \emph{where the topology lives}. Prior
+structured-merge work (and the naive reading of "per-field pushout") treats
+the (identity, field) pairs as a \emph{discrete} product of stalks. We place
+the topology on the tree itself.
+
+\begin{definition}[Ancestry poset]
+The identities $\Id$ of a tree carry the ancestry order $I \sqsubseteq J$
+iff $I = J$ or $I$ is on the parent chain from the root to $J$. The root
+is the unique least element.
+\end{definition}
+
+\begin{definition}[Tree space]
+The \emph{tree space} is $\Id$ equipped with the Alexandrov topology of
+$\sqsubseteq$: $U \subseteq \Id$ is open iff it is ancestor-closed,
+\[
+J \in U \wedge I \sqsubseteq J \;\Longrightarrow\; I \in U.
+\]
+Opens are ancestor-closed subtrees. The smallest open containing $I$ is
+$\uparrow I = \{\text{root},\dots,\text{parent}(I), I\}$. The topology is
+discrete iff the tree is flat ($\sqsubseteq$ is equality).
+\end{definition}
+
+\begin{definition}[Stalk]
+$F_I = \{\bot\} \cup \Node_I$, where $\bot$ = absent and $\Node_I$ is the
+set of node records $(parent, kind, label, text, attrs, order)$.
+\end{definition}
+
+\begin{definition}[Section]
+For an open $U$, a \emph{section} $s \in F(U)$ is an assignment
+$s : U \to \bigsqcup_I F_I$ with $s(I) \in F_I$, satisfying the
+\emph{consistency condition} for every present $I \in U$:
+\begin{equation}
+\tag{C}
+s(I).parent = \bot \;\;\vee\;\; \bigl(s(I).parent = J \wedge J \in U \wedge s(J) \neq \bot\bigr).
+\label{eq:consistency}
+\end{equation}
+A present node has a present parent. Because $U$ is ancestor-closed,
+$J \in U$ holds automatically when $I$ has parent $J$, so (\ref{eq:consistency})
+is checkable within $U$. With the obvious restriction maps $F$ is a sheaf:
+sections agreeing on overlaps glue uniquely (the consistency condition is
+local to the ancestor chain $\uparrow I$). A \emph{global section}
+$S \in F(\Id)$ is the formal counterpart of a consistent tree.
+\end{definition}
+
+\begin{remark}[Identity-location separation]
+The $parent$ field is part of the node \emph{record}, not part of the key.
+Identity (the map key) and location (the $parent$ value) are separated.
+A Move changes $parent$ at a stable identity; a Modify changes $text$ or
+$attrs$ at a stable identity. This is what lets Move+Modify commute
+(\S\ref{sec:algebra}); it is orthogonal to the topology but composes with
+it cleanly.
+\end{remark}
+
+\paragraph{Why the topology is load-bearing.}
+On a discrete space every presheaf is a sheaf and condition (\ref{eq:consistency})
+is vacuous (no ancestry relation). On the tree space, (\ref{eq:consistency})
+is a genuine constraint, and --- as we show in \S\ref{sec:merge}---its
+enforcement during merge surfaces a class of obstructions that no discrete
+model can detect.
+
+
+% ============================================================
+\section{Diff, Apply, Invert, Compose}
+\label{sec:algebra}
+% ============================================================
+
+\begin{definition}[Patch]
+A \emph{patch} records the old and new node for each identity that changed:
+\[
+\Patch = \Id \rightharpoonup (\Node_{\perp} \times \Node_{\perp})
+\]
+where $\Node_{\perp} = \Node \cup \{\perp\}$ and $\perp$ represents absence
+(the identity did not exist, or ceases to exist).
+\end{definition}
+
+\begin{definition}[Diff]
+$\mathrm{diff}(S_1, S_2) = \{ I \mapsto (S_1(I), S_2(I)) \mid S_1(I) \neq
+S_2(I) \}$.
+\end{definition}
+
+\begin{definition}[Apply]
+$\mathrm{apply}(P, S)$: for each $I \in \mathrm{dom}(P)$, verify $S(I) = P(I).old$,
+then set $S(I) \leftarrow P(I).new$ (or remove $I$ if $new = \perp$).
+Fails if any precondition is not met.
+\end{definition}
+
+\begin{definition}[Invert]
+$\mathrm{invert}(P) = \{ I \mapsto (P(I).new, P(I).old) \mid I \in \mathrm{dom}(P) \}$.
+\end{definition}
+
+\begin{definition}[Compose]
+$\mathrm{compose}(P, Q)$: for each identity $I$ in $\mathrm{dom}(P) \cup \mathrm{dom}(Q)$,
+\[
+old = \begin{cases} P(I).old & \text{if } I \in \mathrm{dom}(P) \\ Q(I).old & \text{otherwise} \end{cases}
+\quad
+new = \begin{cases} Q(I).new & \text{if } I \in \mathrm{dom}(Q) \\ P(I).new & \text{otherwise} \end{cases}
+\]
+If $old = new$, the edit cancels (is omitted).
+\end{definition}
+
+These operations satisfy the groupoid laws (verified by property-based
+testing with 2000 random cases each, see \S\ref{sec:impl}):
+\begin{align}
+\mathrm{apply}(\mathrm{diff}(a,b),\, a) &= b \label{eq:roundtrip}\\
+\mathrm{apply}(\mathrm{invert}(P),\, \mathrm{apply}(P, S)) &= S \label{eq:invert}\\
+\mathrm{apply}(\mathrm{compose}(P, Q),\, S) &= \mathrm{apply}(Q,\, \mathrm{apply}(P, S)) \label{eq:compose}\\
+\mathrm{compose}(P,\, \mathrm{invert}(P)) &= \emptyset \label{eq:cancel}\\
+\mathrm{compose}(P,\, \emptyset) &= P = \mathrm{compose}(\emptyset,\, P) \label{eq:identity}\\
+\mathrm{compose}(\mathrm{compose}(P, Q),\, R) &= \mathrm{compose}(P,\, \mathrm{compose}(Q, R)) \label{eq:assoc}
+\end{align}
+
+
+% ============================================================
+\section{Two-Stage Sheaf Merge}
+\label{sec:merge}
+% ============================================================
+
+Given base $B$, ours $O$, theirs $T \in F(\Id)$, merge is the pushout of
+the span $O \leftarrow B \rightarrow T$ in the category $Sh(\Id)$ of sheaves
+on the tree space. In $Sh(\Id)$, colimits are obtained by sheafifying the
+presheaf colimit. This yields a two-stage algorithm.
+
+\paragraph{Stage 1: pointwise pushout $m_0$ (presheaf).}
+Forget the topology and work in $PSh(\Id) = \prod_I \mathbf{Set}^{F_I}$.
+At each identity $I$, take the pushout in $\mathbf{Set}$ of
+$O(I) \leftarrow B(I) \rightarrow T(I)$ field-by-field:
+\[
+m_0(I).f = \begin{cases}
+T(I).f & \text{if } O(I).f = B(I).f \\
+O(I).f & \text{if } T(I).f = B(I).f \\
+O(I).f & \text{if } O(I).f = T(I).f \\
+\text{conflict} & \text{otherwise}
+\end{cases}
+\]
+At a field conflict the node is marked \texttt{Field}-conflicted and takes
+$O(I)$ as best-effort. This $m_0$ is the classical discrete per-field
+pushout. It need not satisfy the consistency condition (\ref{eq:consistency}).
+
+\paragraph{Stage 2: sheafification $\Sigma$.}
+Let $\Sigma : PSh(\Id) \to Sh(\Id)$ be sheafification. Concretely, $\Sigma$
+iterates to a fixpoint: drop every present node whose parent is absent.
+Each dropped identity is a \texttt{Dangling} conflict. The merged section is
+\[
+M = \Sigma(m_0).
+\]
+
+\begin{definition}[Conflict set]
+$C(B,O,T) \;=\; C_{\text{field}}(m_0) \;\uplus\; C_{\text{struct}}(\Sigma)$,
+where $C_{\text{field}}$ collects Stage-1 per-$(I,f)$ pushout failures and
+$C_{\text{struct}}$ collects the support of $\Sigma$'s correction (nodes
+dropped for dangling parents).
+\end{definition}
+
+\paragraph{Move + Modify.}
+If ours moves $I$ (changes $parent$) and theirs modifies $I$ (changes
+$text$/$attrs$), then at $(I,parent)$: $O \neq B$, $T = B$ $\Rightarrow$
+take $O$; at $(I,text)$: $O = B$, $T \neq B$ $\Rightarrow$ take $T$. No
+field conflict, and the moved node's new parent is present by Move's
+precondition, so Stage 2 does not fire. Move + Modify merges cleanly.
+
+\paragraph{The new case: delete-parent + modify-child.}
+If ours deletes parent $P$ and theirs modifies $P$'s child $C$, Stage 1
+gives $m_0 = \{\text{root}, C(\text{modified})\}$ with zero field conflicts
+(each edit is single-sided). But $parent(C) = P$ is now absent, violating
+(\ref{eq:consistency}); $\Sigma$ drops $C$ and records a \texttt{Dangling}
+conflict. \emph{The discrete per-field merge reports this as clean and
+returns a non-section}; the sheaf merge flags it. This is the strict
+refinement of \S\ref{sec:theory}.
+
+
+% ============================================================
+\section{Theorems and Proofs}
+\label{sec:theory}
+% ============================================================
+
+\subsection{Patch Commutation (Stage 1)}
+
+\begin{theorem}[Field Independence]
+\label{thm:field}
+Let $P$ and $Q$ be patches. If for every identity $I$, the fields touched
+by $P$ at $I$ and by $Q$ at $I$ are disjoint, then
+$\mathrm{compose}(P, Q) = \mathrm{compose}(Q, P)$.
+\end{theorem}
+
+\begin{proof}
+At each $(I, f)$: if $f$ is touched only by $P$, both orders yield
+$(P.\text{old}, P.\text{new})$; symmetric for $Q$ alone; if neither, no
+edit. All $(I,f)$ agree.
+\end{proof}
+
+\begin{corollary}[Move-Modify Commutation]
+$\mathrm{Move}(I, A{\to}B)$ and $\mathrm{Modify}(I, v{\to}w)$ commute.
+\end{corollary}
+
+\begin{proof}
+Move touches $(I,parent)$, Modify touches $(I,text)$ or $(I,attrs)$;
+$\{parent\} \cap (\{text\} \cup \{attrs\}) = \emptyset$. These theorems
+live in Stage 1 and are unaffected by $\Sigma$: a well-formed Move's new
+parent $B$ is present, so Stage 2 never fires on a Move.
+\end{proof}
+
+\subsection{Sheaf Pushout and Consistency}
+
+\begin{theorem}[Sheaf Pushout Correctness]
+\label{thm:pushout}
+$\mathrm{merge}(B,O,T) = \Sigma(m_0)$, the pushout of $O \leftarrow B
+\rightarrow T$ in $Sh(\Id)$, with best-effort $O$ chosen at each
+\texttt{Field}-conflicted stalk.
+\end{theorem}
+
+\begin{proof}
+In the category $Sh(\Id)$ of sheaves on the tree space, colimits are obtained
+by sheafifying the presheaf colimit (apply $\Sigma$). The presheaf pushout is
+the pointwise one $m_0$ (a product of stalks has pointwise colimits; each
+factor $\mathbf{Set}$'s pushout is the four-way rule). The algorithm builds
+$m_0$ then applies $\Sigma$ to a fixpoint.
+\end{proof}
+
+\begin{theorem}[Sheaf Consistency Invariant]
+\label{thm:consistency}
+For all $B, O, T \in F(\Id)$, the output $M = \mathrm{merge}(B,O,T)$ is a
+global section: every present node has a present parent (or is the root).
+\end{theorem}
+
+\begin{proof}
+$\Sigma$ is the fixpoint of ``drop present nodes with absent parents.''
+The fixpoint exists (finite $\Id$, each pass removes $\geq 1$ node) and by
+construction satisfies (\ref{eq:consistency}): otherwise the pass would
+not have terminated. Verified by proptest (2000 random scenarios).
+\end{proof}
+
+\subsection{Strict Refinement over the Discrete Merge}
+
+\begin{theorem}[Strict Refinement]
+\label{thm:strict}
+Let $C_{\text{sheaf}}$ be the conflict set of $\mathrm{merge}(B,O,T)$ and
+$C_{\text{disc}}$ that of the discrete Stage-1 merge alone.
+\begin{enumerate}[noitemsep]
+\item[(a)] $C_{\text{disc}} \subseteq C_{\text{sheaf}}$ (every discrete
+  conflict is a sheaf \texttt{Field} conflict);
+\item[(b)] the containment is strict: $\exists\, B,O,T$ with
+  $C_{\text{disc}} = \emptyset$ but $C_{\text{sheaf}} \neq \emptyset$.
+\end{enumerate}
+\end{theorem}
+
+\begin{proof}
+(a) Stage 1 is identical in both; every discrete conflict appears in
+$C_{\text{sheaf}}$ as $C_{\text{field}}$.
+
+(b) Witness. Let $\Id = \{\text{root}, P, C\}$, $parent(C){=}P$,
+$parent(P){=}\text{root}$:
+\[
+B = \{\text{root}, P, C(v{=}1)\},\;
+O = \{\text{root}, C(v{=}1)\},\;
+T = \{\text{root}, P, C(v{=}9)\}.
+\]
+\emph{Discrete.} At $P$: $O(P){=}\bot, B(P){=}P, T(P){=}P$, $T{=}B$
+$\Rightarrow$ take $O(P){=}\bot$ (deletion wins). At $C$: $O(C){=}B(C)$
+$\Rightarrow$ take $T(C)$ (modification wins). No field is double-changed
+$\Rightarrow$ $C_{\text{disc}} = \emptyset$. But the result
+$\{\text{root}, C(v{=}9)\}$ has $parent(C){=}P$ absent: not a section.
+\emph{Sheaf.} $\Sigma$ drops $C$, recording \texttt{Dangling}@$C$;
+$C_{\text{sheaf}} \neq \emptyset$.
+\end{proof}
+
+\begin{remark}
+The witness is the smallest delete-parent / modify-child scenario. The
+class of such witnesses is exactly the support of $\Sigma$'s correction
+--- non-empty iff the tree has depth $\geq 1$ and the two branches' edits
+cross an ancestry edge inconsistently. On a flat (discrete) tree,
+$\Sigma = \mathrm{id}$ and Theorem~\ref{thm:strict} collapses to
+equality: the discrete merge \emph{is} the sheaf merge in that degenerate
+case.
+\end{remark}
+
+\subsection{Clean Merge}
+
+\begin{theorem}[Clean Merge]
+$\mathrm{merge}(B,O,T)$ is conflict-free iff (i) for every $(I,f)$ where
+both branches differ from base they agree, and (ii) $m_0$ already satisfies
+(\ref{eq:consistency}).
+\end{theorem}
+
+\begin{proof}
+(⟸) (i) ⇒ no Stage-1 conflicts; (ii) ⇒ $\Sigma(m_0)=m_0$ ⇒ no Stage-2
+conflicts. (⟹) contrapositive of each.
+\end{proof}
+
+
+% ============================================================
+\section{Implementation}
+\label{sec:impl}
+% ============================================================
+
+We implement the model in Rust as the open-source library \texttt{tate}
+(v2.0.0, MIT license, available on crates.io).
+
+\paragraph{Data structures.} \texttt{Section} is a
+\texttt{BTreeMap<String, Node>}, where \texttt{Node} stores
+\texttt{parent: Option<String>}, \texttt{kind}, \texttt{text},
+\texttt{attrs: Vec<(String,String)>}, and \texttt{order: usize}.
+
+\paragraph{The two stages.} Stage~1 is \texttt{merge\_sections}' per-field
+loop applying the four-way rule at each identity. Stage~2 is the
+\texttt{sheafify} fixpoint: a pass \texttt{dangling\_refs} collects present
+nodes whose \texttt{parent} is absent from the map, records each as a
+\texttt{SectionConflict} of kind \texttt{Dangling}, removes it, and repeats
+until none remain. The output is a consistent global section by
+Theorem~\ref{thm:consistency}.
+
+\paragraph{Conversion.} \texttt{TreeNode::to\_section()} flattens a tree
+into a section (assigning each node its identity, or its kind for keyless
+nodes); \texttt{Section::to\_tree()} rebuilds by walking parent pointers
+from the root.
+
+\paragraph{Property-based testing.} The groupoid laws, the field-wise
+pushout law, and the sheaf-consistency invariant
+(\texttt{law\_merged\_section\_has\_no\_dangling\_parents}) are verified
+by \texttt{proptest} with 2000 randomly generated trees per law. Trees are
+generated with globally unique identities, up to depth 4 and 32 nodes.
+
+\paragraph{Repository.} \url{https://github.com/j-yang/tate}
+
+
+% ============================================================
+\section{Evaluation}
+\label{sec:eval}
+% ============================================================
+
+The central empirical claim of the paper is the Strict-Refinement theorem
+(Theorem~\ref{thm:strict}): the sheaf merge surfaces a class of
+obstructions invisible to the discrete merge. We support it two ways.
+
+\paragraph{Witness test.} The unit test
+\texttt{dangling\_parent\_after\_delete\_modify\_is\_structural\_conflict}
+instantiates the theorem's witness ($\Id = \{\text{root}, P, C\}$; ours
+deletes $P$, theirs modifies $C$) and asserts (i) the sheaf merge reports
+a \texttt{Dangling} conflict at $C$ with \texttt{missing\_parent = P}, and
+(ii) $C$ is dropped from the merged section. The same input under the
+discrete Stage-1 merge produces no conflict and a non-section result.
+
+\paragraph{Universal invariant.} The proptest
+\texttt{law\_merged\_section\_has\_no\_dangling\_parents} generates 2000
+random $(B, O, T)$ triples (independent random trees sharing only the
+root identity) and asserts the merged section never contains a present
+node with an absent parent. This exercises Theorem~\ref{thm:consistency}
+across the whole random input space.
+
+\paragraph{What we do not claim.} We do not report a false-conflict rate
+of line-based merge versus ours on random trees: such a number is an
+artifact of the chosen serialization and diff backend, and a naive
+line-proximity simulation inflates it arbitrarily. A real-world
+evaluation on Git repositories with JSON/YAML is left as future work.
+
+
+% ============================================================
+\section{Related Work}
+% ============================================================
+
+\paragraph{Structured and semi-structured merge.} Apel et al.'s
+semistructured merge~\cite{semistructured} diff-merges ASTs and reports
+reductions in false conflicts versus line-based merge for source code.
+Tools like 3DM (XML), \texttt{jd} and \texttt{jsondiffpatch} (JSON) perform
+3-way merge at the granularity of object keys. These systems separate
+identity from location in practice but, to our knowledge, do not formalise
+merge as a sheaf on the tree space nor prove a structural-conflict class
+that the discrete per-field model misses (Theorem~\ref{thm:strict}).
+
+\paragraph{CRDTs.} Conflict-free Replicated Data Types~\cite{crdt}
+(Automerge, Yjs) provide strong eventual consistency for collaborative
+editing via operation commutation. They use stable node identifiers
+(actor + counter) so that move is a position change, not delete+insert ---
+the same identity-location split we adopt. Our Field-Independence theorem
+(Theorem~\ref{thm:field}) recovers a form of their commutativity from
+field disjointness rather than operation semantics. CRDT tree types
+typically do not model the ancestry topology as a sheaf, and the
+dangling-reference problem after concurrent delete-parent / modify-child
+is handled operationally (e.g.\ tombstones) rather than as a categorical
+obstruction.
+
+\paragraph{Pijul.} Pijul~\cite{pijul} implements a patch theory for text
+based on commutation of line-level operations on a flat sequence. Move in
+Pijul changes the line's position (its key), so Move + Modify does not in
+general commute. Our Move-Modify commutation (Corollary after
+Theorem~\ref{thm:field}) is enabled by the identity-location split.
+
+\paragraph{Git.} Git's recursive 3-way merge~\cite{git} operates on text
+diffs and has no notion of identity: moving a JSON object key is a
+delete+insert at two line ranges, and a delete-parent / modify-child pair
+produces a silently dangling result with no conflict marker.
+
+\paragraph{Sheaf theory and finite spaces.} Our formalism uses the standard
+sheafification functor on a topological space~\cite{godement} and the
+correspondence between finite posets and finite Alexandrov
+spaces~\cite{mccord, barmak}. The non-trivial content is that the ancestry
+topology of a tree is non-discrete as soon as the tree has depth $\geq 1$, so
+sheafification is non-identity and surfaces a structural-conflict class
+invisible to any model that treats the object set as discrete. On a flat tree
+the topology is discrete, every presheaf is a sheaf, and our merge
+specialises to the classical per-field pushout.
+
+
+% ============================================================
+\section{Limitations and Future Work}
+% ============================================================
+
+\paragraph{Keyless data.} Nodes without explicit identity (e.g., JSON
+array items) need auto-assigned identities; same-kind keyless siblings
+collide at one map key. Alignment heuristics (LCS, coordinate descent)
+assign stable identities but are outside this paper's scope.
+
+\paragraph{Integrity scope.} We enforce parent-integrity (present $\Rightarrow$
+parent present). Sibling-order integrity (no duplicate \texttt{order} after
+merge) and deeper structural invariants (uniqueness of the root, acyclicity
+of $parent$) are natural further sheaf constraints left to future work.
+
+\paragraph{Snapshot vs.\ patch commutation.} Our merge is snapshot-based
+(pushout on sections), not patch-based (commutation on operations).
+Cherry-pick and rebase are \texttt{apply}-based and less flexible than
+Pijul's. A full commutation algebra for tree patches is future work.
+
+\paragraph{Empirical evaluation.} A real-world study on Git repositories
+with JSON/YAML, measuring how often the structural-conflict class arises
+in practice, would strengthen the practical claims.
+
+
+% ============================================================
+\section{Conclusion}
+% ============================================================
+
+We placed the topology on the tree. Merge for structured data, viewed as
+a pushout in the sheaf category on the Alexandrov space of ancestry, is
+a two-stage computation: a pointwise per-field pushout (the classical
+discrete merge) followed by sheafification that enforces referential
+integrity. The second stage surfaces a class of obstructions --- a
+present child whose parent was concurrently deleted --- that the discrete
+per-field merge is provably blind to (Theorem~\ref{thm:strict}). Combined
+with identity-location separation, Move + Modify still merges cleanly
+because the two edits touch disjoint fields and the moved node's new
+parent is present. On a flat tree the sheaf specialises to the discrete
+merge; the new content is exactly what the ancestry topology buys.
+
+
+% ============================================================
+\bibliographystyle{plain}
+\begin{thebibliography}{9}
+
+\bibitem{semistructured}
+S.~Apel, J.~Liebig, B.~Brandl, and C.~Lengauer.
+\newblock Semistructured merge: Rethinking merge in revision control systems.
+\newblock In \emph{Proc.\ ESEC/FSE}, 2011.
+
+\bibitem{pijul}
+P.-{\'E}.~Meunier and contributors.
+\newblock Pijul: A sound and fast distributed version control system.
+\newblock \url{https://pijul.org}, 2024.
+
+\bibitem{crdt}
+M.~Shapiro, N.~Pregui{\c{c}}a, C.~Baquero, and M.~Zawirski.
+\newblock Conflict-free replicated data types.
+\newblock In \emph{SSS}, 2011.
+
+\bibitem{git}
+J.~E.~Smith and contributors.
+\newblock Git: A distributed version control system.
+\newblock \url{https://git-scm.com}, 2024.
+
+\bibitem{godement}
+R.~Godement.
+\newblock \emph{Topologie alg\'ebrique et th\'eorie des faisceaux}.
+\newblock Hermann, Paris, 1958.
+
+\bibitem{mccord}
+M.~C.~McCord.
+\newblock Singular homology groups and homotopy types of finite topological
+spaces.
+\newblock \emph{Topology}, 5(3):249--271, 1966.
+
+\bibitem{barmak}
+J.~A.~Barmak.
+\newblock \emph{Algebraic Topology of Finite Topological Spaces and
+Applications}.
+\newblock Lecture Notes in Mathematics 2032, Springer, 2011.
+
+\end{thebibliography}
+
+\end{document}

@@ -415,18 +415,23 @@ pub struct TreeConflict {
 /// # Relationship to the exact pushout
 ///
 /// The *precise* statement "merge is the **pushout** of the span
-/// `ours ← base → theirs` in the category of sections" is realised by
-/// [`crate::patch::merge_sections`], which computes the pushout point-wise on
-/// the lossless [`crate::section::Section`] and is proptest-verified against the
-/// pushout definition. Its conflict set is the **first Čech cohomology** H¹ of
-/// the cover {U_ours, U_theirs} (U_x = locations branch x changed).
+/// `ours ← base → theirs`" is realised by
+/// [`crate::patch::merge_sections`], which computes the pushout in the
+/// sheaf category on the tree space (the identity poset with its Alexandrov
+/// topology): a pointwise per-field pushout followed by **sheafification**
+/// that drops present nodes whose parent is absent (referential integrity).
+/// Its conflict set has two classes: `Field` (per-stalk value disagreements,
+/// the only kind a discrete model sees) and `Dangling` (structural
+/// obstructions from the ancestry topology, invisible to any discrete
+/// per-field merge).
 ///
-/// `tree_merge` agrees with `merge_sections` on *where* conflicts occur; it
-/// differs only in that it reports them with tree-level display detail instead
-/// of raw section values. Use `merge_sections` when you want the algebra; use
-/// `tree_merge` when you want to show a human what clashed.
+/// `tree_merge` is the **display-oriented** merge: it drives off [`tree_diff`]
+/// (the lossy, human-facing diff) so that its [`TreeConflict`]s carry rich,
+/// path-and-attribute-level detail for a UI. It does not perform
+/// sheafification; use `merge_sections` when you want the algebra with
+/// structural-conflict detection.
 ///
-/// See `MATHEMATICS.md` §3 and §5 for details.
+/// See `paper/main.tex` §4 for the full treatment.
 ///
 /// ```
 /// use tate::tree::{TreeNode, tree_merge};

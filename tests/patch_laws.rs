@@ -12,7 +12,10 @@
 //! 9. N-way pushout: merge_sections_nway is point-wise correct
 
 use proptest::prelude::*;
-use tate::patch::{apply, compose, diff, invert, merge_sections, merge_sections_nway, Patch};
+use tate::patch::{
+    apply, compose, diff, invert, merge_sections, merge_sections_nway,
+    Patch, SectionConflictKind,
+};
 use tate::tree::{tree_merge, TreeNode};
 
 fn attrs_strategy() -> impl Strategy<Value = Vec<(String, String)>> {
@@ -176,7 +179,9 @@ proptest! {
 
     /// The merged section at every identity must be consistent with the
     /// field-wise pushout: each field (parent, kind, text, attrs, order)
-    /// is independently merged.
+    /// is independently merged. Identities flagged Dangling (a structural
+    /// obstruction from the tree topology) are dropped from the result, so
+    /// they have no entry in `merged`.
     #[test]
     fn law_merge_is_fieldwise_pushout((base, ours) in tree_pair(), theirs_seed in tree_strategy()) {
         let mut theirs = theirs_seed;
@@ -185,6 +190,11 @@ proptest! {
         let (sb, so, st) = (base.to_section(), ours.to_section(), theirs.to_section());
         let r = merge_sections(&sb, &so, &st);
 
+        let dangling: std::collections::BTreeSet<String> =
+            r.conflicts.iter()
+                .filter(|c| c.kind == SectionConflictKind::Dangling)
+                .map(|c| c.identity.clone())
+                .collect();
         let conflict_ids: std::collections::BTreeSet<String> =
             r.conflicts.iter().map(|c| c.identity.clone()).collect();
 
@@ -198,19 +208,39 @@ proptest! {
             let t = st.nodes.get(id);
             let m = r.merged.nodes.get(id);
 
+            if dangling.contains(id) {
+                prop_assert!(m.is_none(), "dangling id {} must be dropped", id);
+                continue;
+            }
+
             if o == b {
-                // Only theirs moved → take theirs (or absent).
                 prop_assert_eq!(m, t, "only theirs moved at {}", id);
                 prop_assert!(!conflict_ids.contains(id));
             } else if t == b || o == t {
                 prop_assert_eq!(m, o, "only ours moved / both agree at {}", id);
                 prop_assert!(!conflict_ids.contains(id));
             } else if conflict_ids.contains(id) {
-                // Conflict → best-effort favours ours.
-                prop_assert_eq!(m, o, "conflict favours ours at {}", id);
+                prop_assert_eq!(m, o, "field conflict favours ours at {}", id);
             }
-            // If not a conflict and not covered above, field-wise merge
-            // resolved it — just verify the value is plausible (from one side).
+        }
+    }
+
+    /// Sheaf consistency invariant: every present node in the merged section
+    /// has a present parent (or is the root). This is the defining property
+    /// that distinguishes the tree-space sheaf merge from the discrete model.
+    #[test]
+    fn law_merged_section_has_no_dangling_parents((base, ours) in tree_pair(), theirs_seed in tree_strategy()) {
+        let mut theirs = theirs_seed;
+        theirs.identity = Some("root".into());
+
+        let (sb, so, st) = (base.to_section(), ours.to_section(), theirs.to_section());
+        let r = merge_sections(&sb, &so, &st);
+
+        for (id, n) in &r.merged.nodes {
+            if let Some(p) = &n.parent {
+                prop_assert!(r.merged.nodes.contains_key(p),
+                    "dangling parent {} at {} after merge", p, id);
+            }
         }
     }
 
@@ -239,8 +269,12 @@ proptest! {
 
         let r = merge_sections_nway(&base_sec, &branches);
 
-        let conflict_ids: std::collections::BTreeSet<&String> =
-            r.conflicts.iter().map(|c| &c.identity).collect();
+        let field_conflict: std::collections::BTreeSet<&String> = r.conflicts.iter()
+            .filter(|c| c.kind == SectionConflictKind::Field)
+            .map(|c| &c.identity).collect();
+        let dangling: std::collections::BTreeSet<&String> = r.conflicts.iter()
+            .filter(|c| c.kind == SectionConflictKind::Dangling)
+            .map(|c| &c.identity).collect();
 
         let mut ids: std::collections::BTreeSet<String> = base_sec.nodes.keys().cloned().collect();
         for b in &branches {
@@ -252,12 +286,21 @@ proptest! {
             let moved: std::collections::BTreeSet<Option<&tate::section::Node>> = branches.iter()
                 .map(|s| s.nodes.get(id)).filter(|v| v != &b).collect();
 
-            if moved.len() <= 1 {
-                prop_assert!(!conflict_ids.contains(id),
-                    "non-conflict at {} but in conflict set", id);
-            } else {
-                prop_assert!(conflict_ids.contains(id),
-                    "conflict at {} but missing from conflict set", id);
+            if moved.len() > 1 {
+                prop_assert!(field_conflict.contains(id),
+                    "field conflict at {} but missing from conflict set", id);
+            }
+            if dangling.contains(id) {
+                prop_assert!(!r.merged.nodes.contains_key(id),
+                    "dangling id {} must be dropped", id);
+            }
+        }
+
+        // Sheaf consistency invariant: every surviving node has a present parent.
+        for (id, n) in &r.merged.nodes {
+            if let Some(p) = &n.parent {
+                prop_assert!(r.merged.nodes.contains_key(p),
+                    "dangling parent {} at {} after n-way merge", p, id);
             }
         }
     }

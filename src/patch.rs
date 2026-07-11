@@ -4,11 +4,15 @@
 //! old and new [`Node`]. The key operations are [`diff`], [`apply`],
 //! [`invert`], [`compose`], and [`merge_sections`].
 //!
-//! Merge is the field-wise pushout: at each identity, if all three sides
-//! exist but differ, each field (parent, kind, label, text, attrs, order)
-//! is merged independently. This lets two branches that change different
-//! fields of the same node — including Move (parent) + Modify (value) —
-//! merge cleanly.
+//! Merge is the **pushout in the sheaf category on the tree space** (the
+//! identity poset with its Alexandrov topology), computed in two stages:
+//! (1) a pointwise per-field pushout at each identity (each field — parent,
+//! kind, label, text, attrs, order — merged independently by the four-way
+//! rule, so Move+Modify on the same node merges cleanly); (2)
+//! **sheafification** — a fixpoint that drops present nodes whose `parent`
+//! is absent, enforcing referential integrity. Stage 2 surfaces a
+//! `Dangling` conflict class that the discrete per-field model is blind to.
+//! See `paper/main.tex` §4–§5 for the formal treatment.
 
 use std::collections::BTreeMap;
 
@@ -23,12 +27,41 @@ pub struct MergeResult<T, C> {
     pub conflicts: Vec<C>,
 }
 
-/// One obstruction to the pushout: an identity where `ours` and `theirs`
-/// both diverged from `base` to incompatible values.
+/// How a sheaf-pushout obstruction was detected.
+///
+/// Merge is the pushout in the sheaf category on the **tree space** (the
+/// identity poset with its Alexandrov topology), not on a discrete space. That
+/// gives two failure modes. [`Field`](Self::Field) is the per-stalk value
+/// obstruction visible in any model. [`Dangling`](Self::Dangling) is a
+/// *structural* obstruction — a present node whose `parent` references an
+/// absent identity — that is invisible on a discrete space because the discrete
+/// model has no ancestry relation to violate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub enum SectionConflictKind {
+    /// Both branches changed the same field of the same identity to
+    /// incompatible values: the per-stalk pushout in **Set** does not exist.
+    #[default]
+    Field,
+    /// The pointwise pushout produced a present node whose `parent` field
+    /// references an identity absent from the merged section. Sheafification
+    /// drops the node; `missing_parent` records the absent reference.
+    Dangling,
+}
+
+/// One obstruction to the sheaf pushout. For [`SectionConflictKind::Field`],
+/// `identity` is the conflicting node and `base`/`ours`/`theirs` its three
+/// states. For [`SectionConflictKind::Dangling`], `missing_parent` names the
+/// absent identity that the merged node referenced (and `base`/`ours`/`theirs`
+/// carry that node's three states for context).
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 pub struct SectionConflict {
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub kind: SectionConflictKind,
     pub identity: Identity,
+    #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
+    pub missing_parent: Option<Identity>,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
     pub base: Option<Node>,
     #[cfg_attr(feature = "serde", serde(default, skip_serializing_if = "Option::is_none"))]
@@ -149,8 +182,7 @@ pub fn compose(p: &Patch, q: &Patch) -> Patch {
 
 fn merge_field<T: PartialEq + Clone>(o: &T, b: &T, t: &T) -> Option<T> {
     if o == b { Some(t.clone()) }
-    else if t == b { Some(o.clone()) }
-    else if o == t { Some(o.clone()) }
+    else if t == b || o == t { Some(o.clone()) }
     else { None }
 }
 
@@ -182,8 +214,7 @@ fn merge_attrs(
         let merged = match (om.get(key).copied(), bm.get(key).copied(), tm.get(key).copied()) {
             (Some(o), Some(b), Some(t)) => {
                 if o == b { Some(t) }
-                else if t == b { Some(o) }
-                else if o == t { Some(o) }
+                else if t == b || o == t { Some(o) }
                 else { return None }
             }
             (Some(o), Some(b), None) => { if o == b { None } else { return None } }
@@ -218,23 +249,27 @@ pub fn merge_sections(base: &Section, ours: &Section, theirs: &Section) -> Merge
 
         let chosen: Option<Node> = if o == b {
             t.cloned()
-        } else if t == b {
-            o.cloned()
-        } else if o == t {
+        } else if t == b || o == t {
             o.cloned()
         } else if let (Some(bv), Some(ov), Some(tv)) = (b, o, t) {
             match merge_node(bv, ov, tv) {
                 Some(n) => Some(n),
                 None => {
                     conflicts.push(SectionConflict {
-                        identity: id.clone(), base: b.cloned(), ours: o.cloned(), theirs: t.cloned(),
+                        kind: SectionConflictKind::Field,
+                        identity: id.clone(),
+                        missing_parent: None,
+                        base: b.cloned(), ours: o.cloned(), theirs: t.cloned(),
                     });
                     o.cloned()
                 }
             }
         } else {
             conflicts.push(SectionConflict {
-                identity: id.clone(), base: b.cloned(), ours: o.cloned(), theirs: t.cloned(),
+                kind: SectionConflictKind::Field,
+                identity: id.clone(),
+                missing_parent: None,
+                base: b.cloned(), ours: o.cloned(), theirs: t.cloned(),
             });
             o.cloned()
         };
@@ -244,7 +279,54 @@ pub fn merge_sections(base: &Section, ours: &Section, theirs: &Section) -> Merge
         }
     }
 
+    sheafify(base, ours, theirs, &mut merged, &mut conflicts);
     MergeResult { merged: Section { nodes: merged }, conflicts }
+}
+
+/// Detect present nodes whose `parent` references an identity absent from the
+/// map. These are structural obstructions: the pointwise pushout produced a
+/// present child but an absent parent, so the assignment is not a section of
+/// the tree sheaf.
+fn dangling_refs(nodes: &BTreeMap<Identity, Node>) -> Vec<(Identity, Identity)> {
+    nodes.iter()
+        .filter_map(|(id, n)| match &n.parent {
+            Some(p) if !nodes.contains_key(p) => Some((id.clone(), p.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Enforce the sheaf consistency condition (present ⇒ parent present) by
+/// iteratively dropping dangling nodes to a fixpoint. This is the
+/// sheafification step: it turns the pointwise (presheaf) pushout into a valid
+/// global section. Each dropped node is recorded as a
+/// [`SectionConflictKind::Dangling`] obstruction.
+///
+/// On a discrete space this is a no-op (no ancestry relation ⇒ no dangling
+/// refs); the structural conflict class is precisely what the tree topology
+/// adds over the discrete per-field model.
+fn sheafify(
+    base: &Section,
+    ours: &Section,
+    theirs: &Section,
+    merged: &mut BTreeMap<Identity, Node>,
+    conflicts: &mut Vec<SectionConflict>,
+) {
+    loop {
+        let obs = dangling_refs(merged);
+        if obs.is_empty() { break; }
+        for (id, missing) in obs {
+            conflicts.push(SectionConflict {
+                kind: SectionConflictKind::Dangling,
+                identity: id.clone(),
+                missing_parent: Some(missing),
+                base: base.nodes.get(&id).cloned(),
+                ours: ours.nodes.get(&id).cloned(),
+                theirs: theirs.nodes.get(&id).cloned(),
+            });
+            merged.remove(&id);
+        }
+    }
 }
 
 pub fn merge_sections_nway(base: &Section, branches: &[Section]) -> MergeResult<Section, SectionConflict> {
@@ -277,13 +359,42 @@ pub fn merge_sections_nway(base: &Section, branches: &[Section]) -> MergeResult<
             let ours = branches.first().and_then(|s| s.nodes.get(id));
             let theirs = branches.iter().skip(1).find(|s| s.nodes.get(id) != ours).and_then(|s| s.nodes.get(id));
             conflicts.push(SectionConflict {
-                identity: id.clone(), base: b.cloned(), ours: ours.cloned(), theirs: theirs.cloned(),
+                kind: SectionConflictKind::Field,
+                identity: id.clone(),
+                missing_parent: None,
+                base: b.cloned(), ours: ours.cloned(), theirs: theirs.cloned(),
             });
             if let Some(n) = ours { merged_map.insert(id.clone(), n.clone()); }
         }
     }
 
+    sheafify_nway(base, branches, &mut merged_map, &mut conflicts);
     MergeResult { merged: Section { nodes: merged_map }, conflicts }
+}
+
+/// N-way variant of [`sheafify`]: same consistency fixpoint, diagnostics drawn
+/// from the branch set rather than a single ours/theirs pair.
+fn sheafify_nway(
+    base: &Section,
+    branches: &[Section],
+    merged: &mut BTreeMap<Identity, Node>,
+    conflicts: &mut Vec<SectionConflict>,
+) {
+    loop {
+        let obs = dangling_refs(merged);
+        if obs.is_empty() { break; }
+        for (id, missing) in obs {
+            conflicts.push(SectionConflict {
+                kind: SectionConflictKind::Dangling,
+                identity: id.clone(),
+                missing_parent: Some(missing),
+                base: base.nodes.get(&id).cloned(),
+                ours: branches.first().and_then(|s| s.nodes.get(&id)).cloned(),
+                theirs: branches.iter().skip(1).find_map(|s| s.nodes.get(&id)).cloned(),
+            });
+            merged.remove(&id);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -430,5 +541,73 @@ mod tests {
         let mut wrong = sample();
         wrong.children[0].attributes[0].1 = "y".into();
         assert!(apply(&p, &wrong).is_err());
+    }
+
+    // ── sheaf structural conflicts: the class the discrete model misses ──
+
+    fn mk_node(parent: Option<&str>, kind: &str) -> Node {
+        Node {
+            parent: parent.map(String::from),
+            kind: kind.to_string(),
+            label: String::new(),
+            text: String::new(),
+            attrs: Vec::new(),
+            order: 0,
+        }
+    }
+
+    fn section(ids: &[(&str, Node)]) -> Section {
+        Section { nodes: ids.iter().cloned().map(|(k, v)| (k.to_string(), v)).collect() }
+    }
+
+    #[test]
+    fn dangling_parent_after_delete_modify_is_structural_conflict() {
+        // base: root → P → C(v=1)
+        // ours: deletes P (C untouched → still references P)
+        // theirs: modifies C (v=1→9)
+        //
+        // Discrete per-field pushout: at P, ours deleted & theirs unchanged →
+        // P removed; at C, ours unchanged & theirs modified → C kept (v=9).
+        // Result silently keeps a C whose parent P is gone — a non-section.
+        // Sheafification must flag C as Dangling and drop it.
+        let base = section(&[
+            ("root", mk_node(None, "root")),
+            ("P", mk_node(Some("root"), "p")),
+            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "1".into())); n }),
+        ]);
+        let ours = section(&[
+            ("root", mk_node(None, "root")),
+            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "1".into())); n }),
+        ]);
+        let theirs = section(&[
+            ("root", mk_node(None, "root")),
+            ("P", mk_node(Some("root"), "p")),
+            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "9".into())); n }),
+        ]);
+
+        let r = merge_sections(&base, &ours, &theirs);
+
+        assert!(!r.merged.nodes.contains_key("P"), "P deleted by ours");
+        assert!(!r.merged.nodes.contains_key("C"), "C dropped: its parent P is absent");
+        let dang = r.conflicts.iter()
+            .find(|c| c.kind == SectionConflictKind::Dangling && c.identity == "C")
+            .expect("a Dangling conflict at C must be recorded");
+        assert_eq!(dang.missing_parent.as_deref(), Some("P"));
+    }
+
+    #[test]
+    fn merged_section_never_has_dangling_parents() {
+        // Invariant of the sheaf model: every present node has a present parent.
+        let base = sample().to_section();
+        let mut ours = sample();
+        ours.children[0].children.clear(); // delete g1's children (i1, i2)
+        let mut theirs = sample();
+        theirs.children[0].children[0].attributes[0].1 = "99".into();
+        let r = merge_sections(&base, &ours.to_section(), &theirs.to_section());
+        for n in r.merged.nodes.values() {
+            if let Some(p) = &n.parent {
+                assert!(r.merged.nodes.contains_key(p), "dangling parent {p}");
+            }
+        }
     }
 }

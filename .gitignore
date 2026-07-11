@@ -1,2 +1,8 @@
 /target
 bench/target/
+
+# LaTeX build artifacts (source lives in paper/main.tex)
+paper/*.aux
+paper/*.log
+paper/*.out
+paper/*.pdf

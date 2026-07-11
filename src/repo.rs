@@ -119,7 +119,7 @@ impl Repo {
         MergeResult { merged_section, conflicts: result.conflicts, base, ours, theirs }
     }
 
-    pub fn cherry_pick(&mut self, src: Hash, dst: Hash) -> Result<Hash, ApplyError> {
+    pub fn cherry_pick(&mut self, src: Hash, dst: Hash) -> Result<Hash, Box<ApplyError>> {
         let parent = self.commits[&src].parents.first().copied();
         let p = match parent {
             Some(p) => self.diff(p, src),
@@ -127,11 +127,11 @@ impl Repo {
         };
         match patch::apply_to_section(&p, self.section(dst)) {
             Ok(merged) => Ok(self.store_section(merged)),
-            Err(e) => Err(*e),
+            Err(e) => Err(e),
         }
     }
 
-    pub fn revert(&mut self, target: Hash, dst: Hash) -> Result<Hash, ApplyError> {
+    pub fn revert(&mut self, target: Hash, dst: Hash) -> Result<Hash, Box<ApplyError>> {
         let parent = self.commits[&target].parents.first().copied();
         let p = match parent {
             Some(p) => self.diff(p, target),
@@ -140,7 +140,7 @@ impl Repo {
         let inv = patch::invert(&p);
         match patch::apply_to_section(&inv, self.section(dst)) {
             Ok(merged) => Ok(self.store_section(merged)),
-            Err(e) => Err(*e),
+            Err(e) => Err(e),
         }
     }
 
@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn commit_and_log() {
         let mut repo = Repo::new();
-        let v0 = repo.commit("initial", &[], &sample());
+        repo.commit("initial", &[], &sample());
         assert_eq!(repo.len(), 1);
         assert_eq!(repo.log(None).len(), 1);
     }

@@ -8,8 +8,10 @@
 //!   field, not its key in the map.
 //! - **Move + Modify merge cleanly**: moving (parent field) and modifying
 //!   (value fields) touch different fields of the same node → commute.
-//! - **Field-wise pushout merge**: each field (parent, kind, text, attrs,
-//!   order) is merged independently.
+//! - **Sheaf on the tree space**: a section is a global section of the sheaf
+//!   on the ancestry Alexandrov topology; it satisfies referential integrity
+//!   (present ⇒ parent present). Merge's sheafification stage
+//!   ([`crate::patch::merge_sections`]) enforces this.
 
 use std::collections::BTreeMap;
 
