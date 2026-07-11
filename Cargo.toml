@@ -1,13 +1,14 @@
 [package]
 name = "tate"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2021"
 license = "MIT"
-description = "A version control kernel for structured data — identity-keyed sections with field-wise pushout merge"
+description = "A version control kernel for structured data — sheaf pushout merge with referential integrity"
 repository = "https://github.com/j-yang/tate"
 readme = "README.md"
 keywords = ["diff", "merge", "patch", "tree", "sheaf"]
 categories = ["text-processing", "development-tools"]
+exclude = ["paper/"]
 
 [features]
 default = ["serde"]

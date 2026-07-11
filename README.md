@@ -53,7 +53,7 @@ This separation enables:
 
 ```toml
 [dependencies]
-tate = { version = "2", features = ["serde"] }
+tate = { version = "3", features = ["serde"] }
 ```
 
 ### Tree diff
