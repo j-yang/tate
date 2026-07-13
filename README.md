@@ -1,18 +1,19 @@
 # tate
 
-A version control kernel for structured data — a sheaf on the tree space
-with a two-stage pushout merge (pointwise per-field + sheafification for
-referential integrity). Zero format-parsing, zero external diff-engine
-dependencies.
+Structured diff, patch algebra, and sheaf-pushout merge for tree-shaped
+data (JSON / YAML / TOML). Merge is the pushout in the sheaf category on
+the tree space: a pointwise per-field pushout followed by sheafification
+that enforces referential integrity. The library is dependency-light
+(`serde` optional); a companion CLI lives in this same repo as
+[`tate-cli`](cli).
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-## What changed in 2.0
+## The identity-keyed model
 
-**Identity is separated from location.** In tate 1.x, a node's key in the
-section was its full path from root. In tate 2.0, the key is the node's
-**identity** (a string), and its position (parent, order) is stored as a
-**field** of the node.
+**Identity is separated from location.** A node's key in the section is its
+**identity** (a string); its position (`parent`, `order`) is stored as a
+**field** of the node — not as part of the key.
 
 This separation enables:
 
@@ -70,7 +71,7 @@ let d = tree_diff(&a, &b);
 assert_eq!(d.changes[0].kind, ChangeKind::Modified);
 ```
 
-### Move + Modify clean merge (the 2.0 feature)
+### Move + Modify clean merge
 
 ```rust
 use tate::tree::{TreeNode, tree_merge};
@@ -120,6 +121,37 @@ for (id, edit) in &patch.edits {
     println!("  {id}: {:?} -> {:?}", edit.old, edit.new);
 }
 ```
+
+## Command-line tool (`tate-cli`)
+
+A thin CLI over the algebra — structural diff, patch algebra, and a
+**git merge driver** that runs the sheaf merge during `git merge`. It is a
+separate crate in this workspace so the library stays dependency-light.
+
+```bash
+cargo install tate-cli
+```
+
+```bash
+tate diff a.json b.json
+tate patch diff a.json b.json > p.json && tate patch apply p.json a.json
+tate git-merge base.json ours.json theirs.json   # writes result to ours; exit 1 on conflict
+```
+
+### Use as a git merge driver
+
+Once installed, register it so every `git merge` on the registered
+extensions runs the sheaf merge automatically:
+
+```bash
+git config --global merge.tate.driver 'tate git-merge %O %A %B'
+echo '*.json merge=tate' >> .gitattributes
+```
+
+On a **Field** conflict the driver writes standard git conflict markers
+(`<<<<<<<` / `=======` / `>>>>>>>`) into the file for an editor or
+`git mergetool` to resolve. A **Dangling** (structural) conflict is
+reported on stderr and the orphaned node is dropped.
 
 ## Mathematical foundation
 
@@ -174,7 +206,7 @@ Sheaf Consistency, Strict Refinement), and proofs — is in
 - **Sheaf on the tree space.** Merge is the sheaf pushout; output is always
   a consistent section (referential integrity enforced by sheafification).
 - **VCS kernel.** Content-addressed storage + commit DAG + pushout merge.
-- **Tested.** 60 unit tests + 13 property tests + 5 doctests = 78 total.
+- **Tested.** 60 unit + 13 property + 12 CLI + 5 doctests = 90 total.
 
 ## Limitations
 
