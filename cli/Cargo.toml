@@ -1,12 +1,12 @@
 [package]
 name = "tate-cli"
 version = "0.1.0"
-edition = "2021"
-license = "MIT"
 description = "CLI for tate — structural diff and sheaf-pushout merge for JSON, YAML, TOML, and text"
-repository = "https://github.com/j-yang/tate"
 keywords = ["diff", "merge", "git", "json", "structured-data"]
 categories = ["command-line-utilities", "text-processing"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [[bin]]
 name = "tate"

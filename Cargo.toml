@@ -1,18 +1,23 @@
 [package]
 name = "tate"
-version = "3.0.0"
-edition = "2021"
-license = "MIT"
+version = "3.0.1"
 description = "Structured diff, patch algebra, and sheaf-pushout merge for tree-shaped data"
-repository = "https://github.com/j-yang/tate"
 readme = "README.md"
 keywords = ["diff", "merge", "patch", "tree", "sheaf"]
 categories = ["text-processing", "development-tools"]
 exclude = ["paper/", "cli/"]
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 
 [workspace]
 members = ["cli"]
 resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/j-yang/tate"
 
 [features]
 default = ["serde"]
