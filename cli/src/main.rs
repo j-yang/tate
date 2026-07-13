@@ -5,6 +5,8 @@ mod lines;
 mod unified;
 
 use clap::{Parser, Subcommand};
+use serde_json::Value;
+use std::collections::HashMap;
 use tate::patch::{self, merge_sections, Patch, SectionConflict, SectionConflictKind};
 use tate::tree::{self, ChangeKind, TreeNode};
 
@@ -326,6 +328,69 @@ fn cmd_git_diff(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// JSON scalar value of a leaf node, mirroring convert's leaf logic.
+fn node_scalar_value(n: &tate::section::Node) -> Value {
+    use serde_json::Number;
+    if let Some(v) = n.attrs.iter().find(|(k, _)| k == "value").map(|(_, v)| v.as_str()) {
+        return match v {
+            "null" => Value::Null,
+            "true" => Value::Bool(true),
+            "false" => Value::Bool(false),
+            _ => match v.parse::<f64>() {
+                Ok(num) if num.fract() == 0.0 && num.abs() < 1e15 => {
+                    Value::Number(Number::from(num as i64))
+                }
+                Ok(num) => Number::from_f64(num).map(Value::Number).unwrap_or_else(|| Value::String(v.into())),
+                Err(_) => Value::String(v.into()),
+            },
+        };
+    }
+    Value::String(n.text.clone())
+}
+
+/// Pretty-print the merged tree as JSON, injecting git-native conflict markers
+/// (`<<<<<<<` / `=======` / `>>>>>>>`) at Field-conflicted leaves. The output is
+/// intentionally not valid JSON while conflicted — exactly like git's text merge;
+/// the user resolves the markers, then `git add`s. Non-leaf and Dangling conflicts
+/// are left best-effort and reported on stderr.
+fn merge_marked_json(merged: &TreeNode, conflicts: &HashMap<String, (Value, Value)>) -> String {
+    fn emit(node: &TreeNode, conflicts: &HashMap<String, (Value, Value)>, level: usize) -> String {
+        let pad = "  ".repeat(level);
+        if node.children.is_empty() {
+            return convert::tree_to_json_value(node).to_string();
+        }
+        let is_array = node.children.iter().all(|c| c.kind == "[item]");
+        let pad2 = "  ".repeat(level + 1);
+        let parts: Vec<String> = node.children.iter().map(|c| {
+            let eff_key = c.identity.clone().unwrap_or_else(|| c.kind.clone());
+            let marker = conflicts.get(&eff_key)
+                .filter(|_| c.children.is_empty())
+                .map(|(o, t)| {
+                    if is_array {
+                        format!("<<<<<<< ours\n{pad2}{o}\n=======\n{pad2}{t}\n>>>>>>> theirs")
+                    } else {
+                        format!("<<<<<<< ours\n{pad2}\"{eff_key}\": {o}\n=======\n{pad2}\"{eff_key}\": {t}\n>>>>>>> theirs")
+                    }
+                });
+            if let Some(block) = marker {
+                return block;
+            }
+            let body = emit(c, conflicts, level + 1);
+            if is_array {
+                format!("{pad2}{body}")
+            } else {
+                format!("{pad2}\"{eff_key}\": {body}")
+            }
+        }).collect();
+        let (open, close) = if is_array { ("[", "]") } else { ("{", "}") };
+        if parts.is_empty() {
+            return format!("{open}{close}");
+        }
+        format!("{open}\n{}\n{pad}{close}", parts.join(",\n"))
+    }
+    emit(merged, conflicts, 0)
+}
+
 fn cmd_git_merge(base: &str, ours: &str, theirs: &str) -> Result<(), String> {
     let fmt = convert::detect(ours);
     if fmt == convert::Format::Text {
@@ -340,7 +405,21 @@ fn cmd_git_merge(base: &str, ours: &str, theirs: &str) -> Result<(), String> {
         .merged
         .to_tree()
         .ok_or_else(|| "merge produced an empty tree".to_string())?;
-    let output = tree_to_string(&merged_tree, fmt)?;
+
+    let has_conflicts = !result.conflicts.is_empty();
+    let output = if has_conflicts && fmt == convert::Format::Json {
+        let mut sides: HashMap<String, (Value, Value)> = HashMap::new();
+        for c in &result.conflicts {
+            if c.kind == SectionConflictKind::Field {
+                if let (Some(o), Some(t)) = (&c.ours, &c.theirs) {
+                    sides.insert(c.identity.clone(), (node_scalar_value(o), node_scalar_value(t)));
+                }
+            }
+        }
+        merge_marked_json(&merged_tree, &sides)
+    } else {
+        tree_to_string(&merged_tree, fmt)?
+    };
     std::fs::write(ours, &output).map_err(|e| format!("write {ours}: {e}"))?;
 
     if result.conflicts.is_empty() {

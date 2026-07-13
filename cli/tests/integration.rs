@@ -89,6 +89,26 @@ fn git_merge_conflict_same_key_json() {
     assert!(stderr.contains("CONFLICT"));
 }
 
+/// A Field conflict writes git-native conflict markers into the file, so an
+/// editor / `git mergetool` can resolve it like any text conflict.
+#[test]
+fn git_merge_writes_conflict_markers() {
+    let base = write("mk_base.json", r#"{"host": "localhost", "port": 8080}"#);
+    let ours = write("mk_ours.json", r#"{"host": "localhost", "port": 9090}"#);
+    let theirs = write("mk_theirs.json", r#"{"host": "localhost", "port": 3000}"#);
+    let (ok, _, _) = run(&[
+        "git-merge", base.to_str().unwrap(), ours.to_str().unwrap(), theirs.to_str().unwrap(),
+    ]);
+    assert!(!ok);
+    let merged = fs::read_to_string(&ours).unwrap();
+    assert!(merged.contains("<<<<<<< ours"), "missing opener: {merged}");
+    assert!(merged.contains("======="), "missing separator: {merged}");
+    assert!(merged.contains(">>>>>>> theirs"), "missing closer: {merged}");
+    assert!(merged.contains("9090") && merged.contains("3000"), "both sides must appear: {merged}");
+    // non-conflicted key survives cleanly outside the markers
+    assert!(merged.contains("\"host\": \"localhost\""), "clean key must survive: {merged}");
+}
+
 #[test]
 fn git_merge_clean_yaml() {
     let base = write("base.yaml", "a: 1\nb: 2\n");
