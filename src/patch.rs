@@ -561,38 +561,42 @@ mod tests {
     }
 
     #[test]
-    fn dangling_parent_after_delete_modify_is_structural_conflict() {
-        // base: root → P → C(v=1)
-        // ours: deletes P (C untouched → still references P)
-        // theirs: modifies C (v=1→9)
+    fn move_child_delete_target_is_structural_conflict() {
+        // base:   root -> P -> C,  root -> Q
+        // ours:   deletes Q        (section: C still under present P)
+        // theirs: moves C under Q   (section: Q present)
         //
-        // Discrete per-field pushout: at P, ours deleted & theirs unchanged →
-        // P removed; at C, ours unchanged & theirs modified → C kept (v=9).
-        // Result silently keeps a C whose parent P is gone — a non-section.
-        // Sheafification must flag C as Dangling and drop it.
+        // Discrete per-field pushout: at Q, ours deleted & theirs unchanged ->
+        // Q removed; at (C,parent), ours unchanged & theirs moved -> parent(C)=Q.
+        // Each edit single-sided -> no field conflict. Result keeps a present C
+        // whose parent Q is gone — a non-section. Sheafification must flag C as
+        // Dangling and drop it.
         let base = section(&[
             ("root", mk_node(None, "root")),
             ("P", mk_node(Some("root"), "p")),
-            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "1".into())); n }),
+            ("Q", mk_node(Some("root"), "q")),
+            ("C", mk_node(Some("P"), "c")),
         ]);
         let ours = section(&[
             ("root", mk_node(None, "root")),
-            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "1".into())); n }),
+            ("P", mk_node(Some("root"), "p")),
+            ("C", mk_node(Some("P"), "c")),
         ]);
         let theirs = section(&[
             ("root", mk_node(None, "root")),
             ("P", mk_node(Some("root"), "p")),
-            ("C", { let mut n = mk_node(Some("P"), "c"); n.attrs.push(("v".into(), "9".into())); n }),
+            ("Q", mk_node(Some("root"), "q")),
+            ("C", mk_node(Some("Q"), "c")),
         ]);
 
         let r = merge_sections(&base, &ours, &theirs);
 
-        assert!(!r.merged.nodes.contains_key("P"), "P deleted by ours");
-        assert!(!r.merged.nodes.contains_key("C"), "C dropped: its parent P is absent");
+        assert!(!r.merged.nodes.contains_key("Q"), "Q deleted by ours");
+        assert!(!r.merged.nodes.contains_key("C"), "C dropped: its parent Q is absent");
         let dang = r.conflicts.iter()
             .find(|c| c.kind == SectionConflictKind::Dangling && c.identity == "C")
             .expect("a Dangling conflict at C must be recorded");
-        assert_eq!(dang.missing_parent.as_deref(), Some("P"));
+        assert_eq!(dang.missing_parent.as_deref(), Some("Q"));
     }
 
     #[test]

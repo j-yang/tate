@@ -26,8 +26,7 @@
 Referential Integrity via Sheafification}
 
 \author{
-Author One\thanks{Affiliation} \and
-Author Two\thanks{Affiliation}
+Jihao Yang\thanks{AstraZeneca R\&D China, Shanghai, China}
 }
 
 \date{\today}
@@ -79,7 +78,8 @@ line-based merge arise. First, \emph{false conflicts}: two developers
 editing different fields of the same JSON object trigger a conflict
 because their edits are textually adjacent, even though they are logically
 disjoint. Second, and less noticed, \emph{silent structural violations}:
-when one branch deletes a parent element and another edits its child,
+when two branches cross an ancestry edge inconsistently --- for instance,
+one branch deletes a node while another moves a child under it ---
 line-based merge (and, as we show, the discrete per-field merge) will
 happily keep the child with a reference to a now-absent parent --- a
 dangling reference that is not a section of any well-formed tree.
@@ -133,7 +133,7 @@ $\sqsubseteq$: $U \subseteq \Id$ is open iff it is ancestor-closed,
 J \in U \wedge I \sqsubseteq J \;\Longrightarrow\; I \in U.
 \]
 Opens are ancestor-closed subtrees. The smallest open containing $I$ is
-$\uparrow I = \{\text{root},\dots,\text{parent}(I), I\}$. The topology is
+$\downarrow I = \{\text{root},\dots,\text{parent}(I), I\}$. The topology is
 discrete iff the tree is flat ($\sqsubseteq$ is equality).
 \end{definition}
 
@@ -155,7 +155,7 @@ A present node has a present parent. Because $U$ is ancestor-closed,
 $J \in U$ holds automatically when $I$ has parent $J$, so (\ref{eq:consistency})
 is checkable within $U$. With the obvious restriction maps $F$ is a sheaf:
 sections agreeing on overlaps glue uniquely (the consistency condition is
-local to the ancestor chain $\uparrow I$). A \emph{global section}
+local to the ancestor chain $\downarrow I$). A \emph{global section}
 $S \in F(\Id)$ is the formal counterpart of a consistent tree.
 \end{definition}
 
@@ -275,10 +275,13 @@ take $O$; at $(I,text)$: $O = B$, $T \neq B$ $\Rightarrow$ take $T$. No
 field conflict, and the moved node's new parent is present by Move's
 precondition, so Stage 2 does not fire. Move + Modify merges cleanly.
 
-\paragraph{The new case: delete-parent + modify-child.}
-If ours deletes parent $P$ and theirs modifies $P$'s child $C$, Stage 1
-gives $m_0 = \{\text{root}, C(\text{modified})\}$ with zero field conflicts
-(each edit is single-sided). But $parent(C) = P$ is now absent, violating
+\paragraph{The new case: move-child + delete-target.}
+Suppose ours deletes a node $Q$ while theirs moves $C$ so that
+$parent(C)$ becomes $Q$. Both inputs are sections (the moved $C$ sits under
+a present $Q$ in theirs; ours simply omits $Q$). Stage~1 takes the deletion
+at identity $Q$ ($O{\neq}B$, $T{=}B$) and the move at $(C,parent)$
+($O{=}B$, $T{\neq}B$) --- each single-sided, hence zero field conflicts.
+But the merged $m_0$ has $C$ present with $parent(C){=}Q$ absent, violating
 (\ref{eq:consistency}); $\Sigma$ drops $C$ and records a \texttt{Dangling}
 conflict. \emph{The discrete per-field merge reports this as clean and
 returns a non-section}; the sheaf merge flags it. This is the strict
@@ -364,30 +367,38 @@ $C_{\text{disc}}$ that of the discrete Stage-1 merge alone.
 (a) Stage 1 is identical in both; every discrete conflict appears in
 $C_{\text{sheaf}}$ as $C_{\text{field}}$.
 
-(b) Witness. Let $\Id = \{\text{root}, P, C\}$, $parent(C){=}P$,
-$parent(P){=}\text{root}$:
+(b) Witness (four identities). Let $\Id = \{\text{root}, P, Q, C\}$ with
+$parent(P){=}parent(Q){=}\text{root}$ and $parent(C){=}P$ in the base. All
+three inputs are global sections:
 \[
-B = \{\text{root}, P, C(v{=}1)\},\;
-O = \{\text{root}, C(v{=}1)\},\;
-T = \{\text{root}, P, C(v{=}9)\}.
+B = \{\text{root}, P, Q, C\},\quad
+O = \{\text{root}, P, C\},\quad
+T = \{\text{root}, P, Q, C\text{ with } parent(C){=}Q\}.
 \]
-\emph{Discrete.} At $P$: $O(P){=}\bot, B(P){=}P, T(P){=}P$, $T{=}B$
-$\Rightarrow$ take $O(P){=}\bot$ (deletion wins). At $C$: $O(C){=}B(C)$
-$\Rightarrow$ take $T(C)$ (modification wins). No field is double-changed
-$\Rightarrow$ $C_{\text{disc}} = \emptyset$. But the result
-$\{\text{root}, C(v{=}9)\}$ has $parent(C){=}P$ absent: not a section.
-\emph{Sheaf.} $\Sigma$ drops $C$, recording \texttt{Dangling}@$C$;
-$C_{\text{sheaf}} \neq \emptyset$.
+Ours deletes $Q$ ($C$ retains $parent(C){=}P$, still present $\Rightarrow$ a
+section); theirs moves $C$ under $Q$ ($Q$ present $\Rightarrow$ a section).
+
+\emph{Discrete Stage~1.} At identity $Q$: $O(Q){=}\bot$,
+$B(Q){=}T(Q){=}Q$, so $T{=}B$ $\Rightarrow$ take $O{=}\bot$ (deletion wins);
+$Q$ is absent. At $(C,parent)$: $O{=}B{=}P$, $T{=}Q$, so $O{=}B$
+$\Rightarrow$ take $T{=}Q$ (move wins). Every other field agrees. No field
+is double-changed, so $C_{\text{disc}} = \emptyset$. Yet the result has $C$
+present with $parent(C){=}Q$ absent: not a section.
+\emph{Sheaf.} $\Sigma$ drops $C$, recording \texttt{Dangling}@$C$ with
+$\mathit{missing\_parent}{=}Q$; $C_{\text{sheaf}} \neq \emptyset$.
 \end{proof}
 
 \begin{remark}
-The witness is the smallest delete-parent / modify-child scenario. The
-class of such witnesses is exactly the support of $\Sigma$'s correction
---- non-empty iff the tree has depth $\geq 1$ and the two branches' edits
-cross an ancestry edge inconsistently. On a flat (discrete) tree,
-$\Sigma = \mathrm{id}$ and Theorem~\ref{thm:strict} collapses to
-equality: the discrete merge \emph{is} the sheaf merge in that degenerate
-case.
+This is the smallest witness: with three or fewer identities, any section
+that deletes a node must also delete or reparent its descendants, so no
+dangling reference can survive into $m_0$. A fourth identity is needed so
+that the deletion (of $Q$) and the reparenting (of $C$ onto $Q$) live on
+different branches. The class of such witnesses is exactly the support of
+$\Sigma$'s correction --- non-empty iff the tree has depth $\geq 1$ and the
+two branches' edits cross an ancestry edge inconsistently. On a flat
+(discrete) tree, $\Sigma = \mathrm{id}$ and Theorem~\ref{thm:strict}
+collapses to equality: the discrete merge \emph{is} the sheaf merge in that
+degenerate case.
 \end{remark}
 
 \subsection{Clean Merge}
@@ -410,7 +421,7 @@ conflicts. (⟹) contrapositive of each.
 % ============================================================
 
 We implement the model in Rust as the open-source library \texttt{tate}
-(v2.0.0, MIT license, available on crates.io).
+(v3.0.0, MIT license, available on crates.io).
 
 \paragraph{Data structures.} \texttt{Section} is a
 \texttt{BTreeMap<String, Node>}, where \texttt{Node} stores
@@ -449,11 +460,11 @@ The central empirical claim of the paper is the Strict-Refinement theorem
 obstructions invisible to the discrete merge. We support it two ways.
 
 \paragraph{Witness test.} The unit test
-\texttt{dangling\_parent\_after\_delete\_modify\_is\_structural\_conflict}
-instantiates the theorem's witness ($\Id = \{\text{root}, P, C\}$; ours
-deletes $P$, theirs modifies $C$) and asserts (i) the sheaf merge reports
-a \texttt{Dangling} conflict at $C$ with \texttt{missing\_parent = P}, and
-(ii) $C$ is dropped from the merged section. The same input under the
+\texttt{move\_child\_delete\_target\_is\_structural\_conflict}
+instantiates the theorem's witness ($\Id = \{\text{root}, P, Q, C\}$; ours
+deletes $Q$, theirs moves $C$ under $Q$) and asserts (i) the sheaf merge
+reports a \texttt{Dangling} conflict at $C$ with \texttt{missing\_parent = Q},
+and (ii) $C$ is dropped from the merged section. The same input under the
 discrete Stage-1 merge produces no conflict and a non-section result.
 
 \paragraph{Universal invariant.} The proptest
@@ -578,7 +589,7 @@ M.~Shapiro, N.~Pregui{\c{c}}a, C.~Baquero, and M.~Zawirski.
 \newblock In \emph{SSS}, 2011.
 
 \bibitem{git}
-J.~E.~Smith and contributors.
+L.~Torvalds and the Git community.
 \newblock Git: A distributed version control system.
 \newblock \url{https://git-scm.com}, 2024.
 
